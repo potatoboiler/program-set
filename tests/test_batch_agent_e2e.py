@@ -58,8 +58,11 @@ class FakeAnthropicBatchClient:
 class BatchBackedModel(Model):
     """Tiny test adapter between Strands streams and the SQLite batch queue."""
 
-    def __init__(self, transport: BatchTransport) -> None:
+    def __init__(self, transport: BatchTransport, *, agent_id: str) -> None:
+        if not agent_id:
+            raise ValueError("agent_id must be a non-empty stable identifier")
         self.transport = transport
+        self.agent_id = agent_id
         self.config: dict[str, Any] = {}
         self.queued_request_ids: list[str] = []
 
@@ -76,6 +79,9 @@ class BatchBackedModel(Model):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        # Keep the return value an async generator while structured output is unsupported.
+        if False:
+            yield {}
         raise NotImplementedError("structured output is outside this test")
 
     async def stream(
@@ -91,8 +97,17 @@ class BatchBackedModel(Model):
         agent_metadata: AgentMetadata | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
-        params = _anthropic_params(messages, tool_specs, system_prompt)
-        digest = hashlib.sha256(_canonical_json(params).encode()).hexdigest()
+        params = _anthropic_params(
+            messages,
+            tool_specs,
+            system_prompt,
+            system_prompt_content,
+            tool_choice,
+            self.config,
+            kwargs,
+        )
+        identity = {"agent_id": self.agent_id, "params": params}
+        digest = hashlib.sha256(_canonical_json(identity).encode()).hexdigest()
         request_id = f"agent-request-{digest[:24]}"
         custom_id = f"anthropic-custom-{digest[:24]}"
 
@@ -144,6 +159,7 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
     database = tmp_path / "batches.sqlite"
     client = FakeAnthropicBatchClient()
     transport = BatchTransport(client, database)
+    agent_id = "agent-session-e2e"
     tool_calls: list[str] = []
 
     @tool
@@ -153,11 +169,12 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         return f"{query}-result"
 
     try:
-        initial_model = BatchBackedModel(transport)
+        initial_model = BatchBackedModel(transport, agent_id=agent_id)
         initial_agent = Agent(model=initial_model, tools=[lookup])
 
         deferred = initial_agent("look up sample")
         assert deferred.stop_reason == "interrupt"
+        assert deferred.message["role"] == "user"
         assert deferred.interrupts is not None and len(deferred.interrupts) == 1
         first_interrupt = deferred.interrupts[0]
         first_request_id = initial_model.queued_request_ids[0]
@@ -170,10 +187,13 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         first_snapshot = _round_trip_snapshot(
             initial_agent.take_snapshot(
                 preset="session",
-                app_data={"request_id": first_request_id},
+                app_data={"agent_id": agent_id, "request_id": first_request_id},
             )
         )
-        assert first_snapshot.app_data == {"request_id": first_request_id}
+        assert first_snapshot.app_data == {
+            "agent_id": agent_id,
+            "request_id": first_request_id,
+        }
 
         first_batch = transport.flush()
         assert first_batch == BatchInfo("msgbatch_fake_1", "in_progress")
@@ -209,7 +229,9 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         # Re-open the DB and construct a new provider and Agent, just as after a
         # process restart. The original request is now read from SQLite.
         transport = BatchTransport(client, database)
-        resumed_model = BatchBackedModel(transport)
+        resumed_model = BatchBackedModel(
+            transport, agent_id=first_snapshot.app_data["agent_id"]
+        )
         resumed_agent = Agent(model=resumed_model, tools=[lookup])
         resumed_agent.load_snapshot(first_snapshot)
         after_tool_use = resumed_agent(
@@ -238,10 +260,13 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         second_snapshot = _round_trip_snapshot(
             resumed_agent.take_snapshot(
                 preset="session",
-                app_data={"request_id": second_request_id},
+                app_data={"agent_id": agent_id, "request_id": second_request_id},
             )
         )
-        assert second_snapshot.app_data == {"request_id": second_request_id}
+        assert second_snapshot.app_data == {
+            "agent_id": agent_id,
+            "request_id": second_request_id,
+        }
 
         second_batch = transport.flush()
         assert second_batch == BatchInfo("msgbatch_fake_2", "in_progress")
@@ -272,7 +297,12 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         # Re-open again to prove that the follow-up response, too, is consumed
         # from durable transport state by a fresh Agent/provider pair.
         transport = BatchTransport(client, database)
-        final_agent = Agent(model=BatchBackedModel(transport), tools=[lookup])
+        final_agent = Agent(
+            model=BatchBackedModel(
+                transport, agent_id=second_snapshot.app_data["agent_id"]
+            ),
+            tools=[lookup],
+        )
         final_agent.load_snapshot(second_snapshot)
         completed = final_agent(
             [
@@ -289,6 +319,21 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         assert completed.message["content"] == [
             {"text": "The lookup returned sample-result."}
         ]
+        history = final_agent.messages
+        assert [message["role"] for message in history] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert any("toolUse" in block for block in history[1]["content"])
+        assert any("toolResult" in block for block in history[2]["content"])
+        assert history[3]["content"] == [
+            {"text": "The lookup returned sample-result."}
+        ]
+        assert completed.interrupts is None or completed.interrupts == []
+        final_snapshot = final_agent.take_snapshot(preset="session")
+        assert final_snapshot.data["interrupt_state"]["activated"] is False
         assert tool_calls == ["sample"]
         assert [batch.batch_id for batch in transport.list_batches()] == [
             "msgbatch_fake_1",
@@ -300,17 +345,52 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         transport.close()
 
 
+def test_identical_requests_from_distinct_agents_get_distinct_ids(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "agents.sqlite")
+    try:
+        left_model = BatchBackedModel(transport, agent_id="agent-left")
+        right_model = BatchBackedModel(transport, agent_id="agent-right")
+        left = Agent(model=left_model)
+        right = Agent(model=right_model)
+
+        left_result = left("same request")
+        right_result = right("same request")
+
+        assert left_result.stop_reason == "interrupt"
+        assert right_result.stop_reason == "interrupt"
+        left_request_id = left_model.queued_request_ids[0]
+        right_request_id = right_model.queued_request_ids[0]
+        assert left_request_id != right_request_id
+        assert (
+            transport.get_request(left_request_id).custom_id
+            != transport.get_request(right_request_id).custom_id
+        )
+        assert client.submissions == []
+    finally:
+        transport.close()
+
+
 def _anthropic_params(
     messages: Messages,
     tool_specs: list[ToolSpec] | None,
     system_prompt: str | None,
+    system_prompt_content: list[SystemContentBlock] | None,
+    tool_choice: ToolChoice | None,
+    model_config: Mapping[str, Any],
+    extra_params: Mapping[str, Any],
 ) -> dict[str, object]:
-    params: dict[str, object] = {
-        "model": "claude-test",
-        "max_tokens": 128,
-        "messages": [_anthropic_message(message) for message in messages],
-    }
-    if system_prompt:
+    params: dict[str, object] = dict(model_config)
+    params.setdefault("model", "claude-test")
+    params.setdefault("max_tokens", 128)
+    params["messages"] = [_anthropic_message(message) for message in messages]
+    if system_prompt_content:
+        params["system"] = [
+            _anthropic_content_block(block) for block in system_prompt_content
+        ]
+    elif system_prompt:
         params["system"] = system_prompt
     if tool_specs:
         params["tools"] = [
@@ -323,6 +403,17 @@ def _anthropic_params(
             }
             for spec in tool_specs
         ]
+    if tool_choice:
+        if "auto" in tool_choice:
+            params["tool_choice"] = {"type": "auto"}
+        elif "any" in tool_choice:
+            params["tool_choice"] = {"type": "any"}
+        else:
+            params["tool_choice"] = {
+                "type": "tool",
+                "name": tool_choice["tool"]["name"],
+            }
+    params.update(extra_params)
     return params
 
 

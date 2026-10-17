@@ -5,6 +5,9 @@ import unittest
 from pathlib import Path
 from typing import Sequence
 
+import anthropic
+import httpx2
+
 from program_set.batch_transport import (
     AnthropicBatchClient,
     BatchInfo,
@@ -179,6 +182,56 @@ class BatchTransportTests(unittest.TestCase):
             self.transport.enqueue(
                 request("different"), request_id="same", metadata={"source": "one"}
             )
+
+    def test_anthropic_custom_id_and_unsupported_params_are_rejected(self) -> None:
+        for index, custom_id in enumerate(
+            ("", "contains.dot", "has space", "x" * 65, "é")
+        ):
+            with self.subTest(custom_id=custom_id), self.assertRaises(ValueError):
+                self.transport.enqueue(
+                    request(), request_id=f"invalid-{index}", custom_id=custom_id
+                )
+
+        accepted = self.transport.enqueue(
+            request(), request_id="valid", custom_id="a" * 64
+        )
+        self.assertEqual(accepted.custom_id, "a" * 64)
+
+        for unsupported in ({"stream": True}, {"speed": "fast"}):
+            params = {**request(), **unsupported}
+            with self.subTest(params=unsupported), self.assertRaises(ValueError):
+                self.transport.enqueue(
+                    params,
+                    request_id=f"unsupported-{len(unsupported)}-{next(iter(unsupported))}",
+                )
+
+    def test_real_sdk_batch_create_uses_zero_retries(self) -> None:
+        attempts = 0
+
+        def fail_request(_: httpx2.Request) -> httpx2.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx2.Response(
+                500,
+                json={"error": {"type": "api_error", "message": "mock failure"}},
+            )
+
+        http_client = httpx2.Client(transport=httpx2.MockTransport(fail_request))
+        sdk_client = anthropic.Anthropic(api_key="test-only", http_client=http_client)
+        try:
+            adapter = AnthropicBatchClient(sdk_client)
+            with self.assertRaises(anthropic.APIStatusError):
+                adapter.create_batch(
+                    [
+                        {
+                            "custom_id": "sdk-test",
+                            "params": request(),
+                        }
+                    ]
+                )
+            self.assertEqual(attempts, 1)
+        finally:
+            sdk_client.close()
 
     def test_result_with_unknown_custom_id_is_rejected(self) -> None:
         self.transport.enqueue(request(), request_id="known")

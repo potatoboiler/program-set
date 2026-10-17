@@ -6,10 +6,14 @@ events and an in-memory fake queue only; it makes no network/API calls.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from importlib.metadata import version
 from typing import Any
 
+import pytest
+from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.hooks.events import AfterInvocationEvent
 
@@ -116,3 +120,15 @@ def test_provider_interrupt_snapshot_restore_and_stock_tool_cycle() -> None:
     assert tool_calls == ["sample"]
     assert recorder.stop_reasons == ["interrupt", "end_turn"]
     assert len(queue.submissions) == 3  # defer, stored tool-use response, tool-result follow-up
+
+
+def test_structured_output_is_an_async_generator_stub() -> None:
+    model = DeferredQueueModel(InMemoryDeferredQueue(followup_response=[]))
+    stream = model.structured_output(BaseModel, [])
+    assert inspect.isasyncgen(stream)
+
+    async def consume() -> None:
+        with pytest.raises(NotImplementedError, match="outside this experiment"):
+            await anext(stream)
+
+    asyncio.run(consume())

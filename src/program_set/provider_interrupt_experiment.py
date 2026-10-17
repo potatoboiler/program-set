@@ -98,6 +98,9 @@ class DeferredQueueModel(Model):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> AsyncGenerator[dict[str, Any], None]:
+        # Keep the return value an async generator while structured output is unsupported.
+        if False:
+            yield {}
         raise NotImplementedError("structured output is outside this experiment")
 
     async def stream(

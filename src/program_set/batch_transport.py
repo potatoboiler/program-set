@@ -7,6 +7,7 @@ does not read or persist Strands conversation or graph state.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -91,13 +92,26 @@ class AnthropicBatchClient:
 
     The SDK client is injected by the application, so constructing this adapter
     never creates a client, reads credentials, or makes a request.
+
+    Clients exposing the public ``with_options`` method use per-call retries
+    disabled for batch creation. Lightweight test doubles without that method
+    are called directly and should not add their own retry behavior.
     """
 
     def __init__(self, client: object) -> None:
         self._client = cast(_AnthropicSDKClient, client)
 
     def create_batch(self, requests: Sequence[MessagesBatchRequest]) -> BatchInfo:
-        response = self._batch_resource().create(requests=list(requests))
+        with_options = getattr(self._client, "with_options", None)
+        if callable(with_options):
+            # A POST retry after a timeout could create duplicate remote work.
+            resource = cast(
+                _AnthropicSDKClient, with_options(max_retries=0)
+            ).messages.batches
+        else:
+            # Keep compatibility with injected deterministic SDK-shaped fakes.
+            resource = self._batch_resource()
+        response = resource.create(requests=list(requests))
         return _batch_info(response)
 
     def retrieve_batch(self, batch_id: str) -> BatchInfo:
@@ -182,7 +196,8 @@ class BatchTransport:
         The payload must contain ``model``, ``max_tokens``, and ``messages``.
         If IDs are omitted, UUIDs are generated once and persisted. By default
         ``custom_id`` equals ``request_id``; supplying either ID lets callers
-        correlate results with their own durable work identifiers.
+        correlate results with their own durable work identifiers. Anthropic's
+        custom ID character and length constraints are checked before storage.
         Re-enqueueing identical data under the same request ID is idempotent.
         """
 
@@ -193,6 +208,7 @@ class BatchTransport:
             custom_id = request_id
         _validate_id(request_id, "request_id")
         _validate_id(custom_id, "custom_id")
+        _validate_custom_id(custom_id)
         if metadata is not None and not isinstance(metadata, Mapping):
             raise TypeError("metadata must be a mapping")
         request_metadata = dict(metadata or {})
@@ -509,12 +525,23 @@ def _validated_params(params: Mapping[str, object]) -> dict[str, object]:
         raise ValueError("params['max_tokens'] must be a positive integer")
     if not isinstance(params["messages"], list) or not params["messages"]:
         raise ValueError("params['messages'] must be a non-empty list")
+    if params.get("stream") is True:
+        raise ValueError("stream=True is not supported in Anthropic Message Batches")
+    if "speed" in params:
+        raise ValueError("the speed parameter is not supported in Anthropic Message Batches")
     return cast(dict[str, object], json.loads(_dump_json(dict(params))))
 
 
 def _validate_id(value: str, name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
+
+
+def _validate_custom_id(value: str) -> None:
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is None:
+        raise ValueError(
+            "custom_id must contain 1-64 ASCII letters, digits, underscores, or hyphens"
+        )
 
 
 def _batch_info(value: object) -> BatchInfo:
