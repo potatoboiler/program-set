@@ -1,13 +1,16 @@
 [project]
 name = "program-set"
 version = "0.1.0"
-description = "Add your description here"
+description = "Experiments with Strands agents and Anthropic Message Batches"
 readme = "README.md"
 authors = [
     { name = "potatoboiler", email = "61665896+potatoboiler@users.noreply.github.com" }
 ]
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "anthropic>=1.14.0,<2.0.0",
+    "strands-agents>=1.61.0,<2.0.0",
+]
 
 [project.scripts]
 program-set = "program_set:main"
