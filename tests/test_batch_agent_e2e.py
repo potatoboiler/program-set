@@ -7,17 +7,23 @@ coroutine waiting for the batch to finish.
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 from collections.abc import Sequence
+from importlib.metadata import version
 from pathlib import Path
 
+import pytest
+from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
+from strands.interrupt import InterruptException
 
 from program_set.batch_model import BatchBackedModel
 from program_set.batch_transport import (
     BatchInfo,
+    BatchRequestEnvelope,
     BatchTransport,
-    MessagesBatchRequest,
 )
 
 
@@ -25,10 +31,18 @@ class FakeAnthropicBatchClient:
     """In-memory fake for Anthropic's documented batch request/result shapes."""
 
     def __init__(self) -> None:
-        self.submissions: list[list[MessagesBatchRequest]] = []
+        self.submissions: list[list[BatchRequestEnvelope]] = []
         self._batches: dict[str, tuple[str, list[object]]] = {}
 
-    def create_batch(self, requests: Sequence[MessagesBatchRequest]) -> BatchInfo:
+    def validate_requests(
+        self, requests: Sequence[BatchRequestEnvelope]
+    ) -> None:
+        return None
+
+    def create_batch(
+        self, requests: Sequence[BatchRequestEnvelope], *, validated: object
+    ) -> BatchInfo:
+        del validated
         batch_id = f"msgbatch_fake_{len(self.submissions) + 1}"
         self.submissions.append(list(requests))
         self._batches[batch_id] = ("in_progress", [])
@@ -38,7 +52,10 @@ class FakeAnthropicBatchClient:
         status, _ = self._batches[batch_id]
         return BatchInfo(batch_id, status)
 
-    def iter_batch_results(self, batch_id: str) -> list[object]:
+    def iter_batch_results(
+        self, batch_id: str, *, expected_custom_ids: Sequence[str]
+    ) -> list[object]:
+        del expected_custom_ids
         return self._batches[batch_id][1]
 
     def complete(self, batch_id: str, results: list[object]) -> None:
@@ -46,6 +63,7 @@ class FakeAnthropicBatchClient:
 
 
 def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Path) -> None:
+    assert version("strands-agents") == "1.61.1"
     database = tmp_path / "batches.sqlite"
     client = FakeAnthropicBatchClient()
     transport = BatchTransport(client, database)
@@ -269,6 +287,51 @@ def test_identical_requests_from_distinct_agents_get_distinct_ids(
             != transport.get_request(right_request_id).custom_id
         )
         assert client.submissions == []
+    finally:
+        transport.close()
+
+
+def test_anthropic_request_drops_strands_runtime_kwargs(tmp_path: Path) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "runtime-kwargs.sqlite")
+    model = BatchBackedModel(
+        transport, agent_id="runtime-kwargs", model_id="claude-test"
+    )
+
+    async def defer() -> None:
+        with pytest.raises(InterruptException):
+            await anext(
+                model.stream(
+                    [{"role": "user", "content": "hello"}],
+                    model_state={"response_id": "must-not-leak"},
+                    dynamic_trailing_blocks=2,
+                    max_tokens=32,
+                )
+            )
+
+    try:
+        asyncio.run(defer())
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        params = client.submissions[0][0]["params"]
+        assert params["max_tokens"] == 32
+        assert "model_state" not in params
+        assert "dynamic_trailing_blocks" not in params
+    finally:
+        transport.close()
+
+
+def test_structured_output_is_an_async_generator_stub(tmp_path: Path) -> None:
+    transport = BatchTransport(FakeAnthropicBatchClient(), tmp_path / "stub.sqlite")
+    model = BatchBackedModel(transport, agent_id="stub", model_id="claude-test")
+    stream = model.structured_output(BaseModel, [])
+    assert inspect.isasyncgen(stream)
+
+    async def consume() -> None:
+        with pytest.raises(NotImplementedError, match="structured output"):
+            await anext(stream)
+
+    try:
+        asyncio.run(consume())
     finally:
         transport.close()
 
