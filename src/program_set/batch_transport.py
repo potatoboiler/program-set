@@ -137,7 +137,7 @@ class AnthropicBatchClient:
         self, batch_id: str, *, expected_custom_ids: Sequence[str]
     ) -> Iterable[object]:
         del expected_custom_ids
-        return cast(Iterable[object], self._batch_resource().results(batch_id))
+        return self._batch_resource().results(batch_id)
 
     def _batch_resource(self) -> _AnthropicBatchesResource:
         return self._client.messages.batches
@@ -205,7 +205,7 @@ class BatchTransport:
         *,
         request_id: str | None = None,
         custom_id: str | None = None,
-        metadata: Mapping[str, str] | None = None,
+        metadata: Mapping[str, object] | None = None,
     ) -> EnqueuedRequest:
         """Persist an opaque provider request and return its stable IDs.
 
@@ -223,14 +223,11 @@ class BatchTransport:
             custom_id = request_id
         _validate_id(request_id, "request_id")
         _validate_id(custom_id, "custom_id")
-        if metadata is not None and not isinstance(metadata, Mapping):
-            raise TypeError("metadata must be a mapping")
-        request_metadata = dict(metadata or {})
-        if not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in request_metadata.items()
-        ):
-            raise TypeError("metadata must map strings to strings")
+        request_metadata: dict[str, str] = {}
+        for key, value in (metadata or {}).items():
+            if not isinstance(value, str):
+                raise TypeError("metadata must map strings to strings")
+            request_metadata[key] = value
 
         payload_json = _dump_json(payload)
         metadata_json = _dump_json(request_metadata)
@@ -395,7 +392,7 @@ class BatchTransport:
                     f"unsupported result type {result_status!r} for {custom_id!r}"
                 )
             results_by_custom_id[custom_id] = (
-                cast(str, result_status),
+                result_status,
                 _dump_json(_jsonable(result)),
             )
 
@@ -526,26 +523,22 @@ class BatchTransport:
             )
 
 
-def _validated_params(params: Mapping[str, object]) -> dict[str, object]:
+def _validated_params(params: object) -> dict[str, object]:
     if not isinstance(params, Mapping):
         raise TypeError("params must be a mapping")
-    return cast(dict[str, object], json.loads(_dump_json(dict(params))))
+    mapping = cast(Mapping[object, object], params)
+    return cast(dict[str, object], json.loads(_dump_json(dict(mapping))))
 
 
 def _validate_anthropic_request(request: BatchRequestEnvelope) -> None:
-    custom_id = request.get("custom_id")
-    if (
-        not isinstance(custom_id, str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", custom_id) is None
-    ):
+    custom_id = request["custom_id"]
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", custom_id) is None:
         raise ValueError(
             "Anthropic custom_id must contain 1-64 ASCII letters, digits, "
             "underscores, or hyphens"
         )
 
-    params = request.get("params")
-    if not isinstance(params, Mapping):
-        raise TypeError("Anthropic request params must be a mapping")
+    params = request["params"]
     model = params.get("model")
     if not isinstance(model, str) or not model.strip():
         raise ValueError("Anthropic request model must be a non-empty string")
@@ -566,7 +559,7 @@ def _validate_anthropic_request(request: BatchRequestEnvelope) -> None:
 
 
 def _validate_id(value: str, name: str) -> None:
-    if not isinstance(value, str) or not value.strip():
+    if not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
 
 
@@ -579,15 +572,14 @@ def _batch_info(value: object) -> BatchInfo:
 
 
 def _validate_batch_info(batch: BatchInfo) -> None:
-    if not isinstance(batch, BatchInfo):
-        raise BatchProtocolError("batch client must return BatchInfo")
     if not batch.batch_id or not batch.processing_status:
         raise BatchProtocolError("batch response is missing id/status")
 
 
 def _field(value: object, name: str) -> object:
     if isinstance(value, Mapping):
-        return value.get(name)
+        mapping = cast(Mapping[str, object], value)
+        return mapping.get(name)
     return getattr(value, name, None)
 
 
