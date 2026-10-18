@@ -17,7 +17,7 @@ from program_set.batch_transport import BatchTransport
 from program_set.deferred_batch_model import DeferredBatchModel, canonical_json
 from program_set.openai_responses_request import (
     OpenAIResponsesRequest,
-    _decode_reasoning_item,
+    decode_reasoning_item,
 )
 
 
@@ -154,7 +154,7 @@ def _responses_input(messages: Messages) -> list[dict[str, object]]:
                         "reasoning content without an opaque OpenAI signature"
                     )
                 try:
-                    reasoning = _decode_reasoning_item(signature)
+                    reasoning = decode_reasoning_item(signature)
                 except ValueError:
                     raise NotImplementedError(
                         "reasoning signature was not produced by this adapter"

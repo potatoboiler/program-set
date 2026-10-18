@@ -626,9 +626,9 @@ def test_tool_cycle_without_reasoning_item_has_no_reasoning_input(
 
 def test_opaque_reasoning_signature_round_trips_urlsafe_alphabet() -> None:
     from program_set.openai_responses_request import (
-        _REASONING_SIGNATURE_PREFIX,
-        _decode_reasoning_item,
-        _encode_reasoning_item,
+        REASONING_SIGNATURE_PREFIX,
+        decode_reasoning_item,
+        encode_reasoning_item,
     )
 
     item = {
@@ -637,11 +637,11 @@ def test_opaque_reasoning_signature_round_trips_urlsafe_alphabet() -> None:
         "summary": [{"type": "summary_text", "text": "3f>o"}],
         "status": "completed",
     }
-    signature = _encode_reasoning_item(item)
-    encoded = signature[len(_REASONING_SIGNATURE_PREFIX) :]
+    signature = encode_reasoning_item(item)
+    encoded = signature[len(REASONING_SIGNATURE_PREFIX) :]
     assert set(encoded) & set("-_")
 
-    decoded = _decode_reasoning_item(signature)
+    decoded = decode_reasoning_item(signature)
     assert decoded.model_dump(mode="json", exclude_none=True) == item
 
 

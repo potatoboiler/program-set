@@ -48,10 +48,10 @@ class ResponsesReasoningItem(_StrictModel):
     status: Literal["in_progress", "completed", "incomplete"] | None = None
 
 
-_REASONING_SIGNATURE_PREFIX = "openai-responses-reasoning:v1:"
+REASONING_SIGNATURE_PREFIX = "openai-responses-reasoning:v1:"
 
 
-def _encode_reasoning_item(item: Mapping[str, object]) -> str:
+def encode_reasoning_item(item: Mapping[str, object]) -> str:
     """Encode a reasoning item opaquely for Strands message history."""
 
     try:
@@ -64,17 +64,17 @@ def _encode_reasoning_item(item: Mapping[str, object]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
-    return _REASONING_SIGNATURE_PREFIX + base64.urlsafe_b64encode(payload).decode(
+    return REASONING_SIGNATURE_PREFIX + base64.urlsafe_b64encode(payload).decode(
         "ascii"
     )
 
 
-def _decode_reasoning_item(signature: str) -> ResponsesReasoningItem:
+def decode_reasoning_item(signature: str) -> ResponsesReasoningItem:
     """Decode an opaque reasoning item previously produced by this adapter."""
 
-    if not signature.startswith(_REASONING_SIGNATURE_PREFIX):
+    if not signature.startswith(REASONING_SIGNATURE_PREFIX):
         raise ValueError("unsupported reasoning signature")
-    encoded = signature[len(_REASONING_SIGNATURE_PREFIX) :]
+    encoded = signature[len(REASONING_SIGNATURE_PREFIX) :]
     try:
         standard = encoded.translate(str.maketrans("-_", "+/"))
         payload = base64.b64decode(standard.encode("ascii"), validate=True)

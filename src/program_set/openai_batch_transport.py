@@ -23,7 +23,7 @@ from program_set.batch_transport import (
 from program_set.openai_responses_request import (
     OpenAIResponsesBatchLine,
     OpenAIResponsesRequest,
-    _encode_reasoning_item,
+    encode_reasoning_item,
 )
 
 _ENDPOINT: Literal["/v1/responses"] = "/v1/responses"
@@ -333,7 +333,7 @@ def _responses_message(body: Mapping[str, object], custom_id: str) -> dict[str, 
             )
         elif item_type == "reasoning":
             try:
-                signature = _encode_reasoning_item(item)
+                signature = encode_reasoning_item(item)
             except ValueError:
                 # Do not echo reasoning contents in the error.
                 raise BatchProtocolError(
