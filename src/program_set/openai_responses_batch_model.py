@@ -7,11 +7,11 @@ the JSONL boundary by ``OpenAIResponsesRequest``.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
 from strands.types.content import Messages, SystemContentBlock
-from strands.types.tools import ToolChoice, ToolSpec
+from strands.types.tools import ToolChoice, ToolChoiceToolDict, ToolSpec
 
 from program_set.batch_transport import BatchTransport
 from program_set.deferred_batch_model import DeferredBatchModel, canonical_json
@@ -74,8 +74,10 @@ def _responses_params(
     extra_params: Mapping[str, Any],
 ) -> dict[str, object]:
     text_config = extra_params.get("text", model_config.get("text"))
-    if "response_format" in model_config or "response_format" in extra_params or (
-        isinstance(text_config, Mapping) and "format" in text_config
+    if (
+        "response_format" in model_config
+        or "response_format" in extra_params
+        or (isinstance(text_config, Mapping) and "format" in text_config)
     ):
         raise NotImplementedError(
             "structured output is not supported in this experiment"
@@ -95,9 +97,10 @@ def _responses_params(
         elif "any" in tool_choice:
             params["tool_choice"] = "required"
         else:
+            forced = cast(ToolChoiceToolDict, tool_choice)
             params["tool_choice"] = {
                 "type": "function",
-                "name": tool_choice["tool"]["name"],
+                "name": forced["tool"]["name"],
             }
     params.update(extra_params)
     request = OpenAIResponsesRequest.model_validate(params)
@@ -115,7 +118,7 @@ def _responses_input(messages: Messages) -> list[dict[str, object]]:
             converted.append({"role": role, "content": content})
             continue
         if not isinstance(content, list):
-            raise ValueError("Strands message content must be text or a block list")
+            raise TypeError("Strands message content must be text or a block list")
 
         if role in {"system", "developer"}:
             converted.append({"role": role, "content": _text_blocks(content)})
@@ -156,9 +159,7 @@ def _responses_input(messages: Messages) -> list[dict[str, object]]:
                     raise NotImplementedError(
                         "reasoning signature was not produced by this adapter"
                     ) from None
-                converted.append(
-                    reasoning.model_dump(mode="json", exclude_none=True)
-                )
+                converted.append(reasoning.model_dump(mode="json", exclude_none=True))
                 emitted = True
             elif role == "assistant" and "toolUse" in block:
                 if text_parts:
@@ -208,7 +209,7 @@ def _instructions(
     return system_prompt
 
 
-def _text_blocks(blocks: list[Mapping[str, object]]) -> str:
+def _text_blocks(blocks: Sequence[Mapping[str, object]]) -> str:
     parts: list[str] = []
     for block in blocks:
         text = block.get("text")

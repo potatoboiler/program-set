@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, cast
 
 from strands.types.content import Messages, SystemContentBlock
-from strands.types.tools import ToolChoice, ToolSpec
+from strands.types.tools import ToolChoice, ToolChoiceToolDict, ToolSpec
 
 from program_set.batch_transport import BatchTransport
 from program_set.deferred_batch_model import DeferredBatchModel
@@ -77,9 +77,7 @@ def _anthropic_params(
             {
                 "name": spec["name"],
                 "description": spec.get("description", ""),
-                "input_schema": spec["inputSchema"].get(
-                    "json", spec["inputSchema"]
-                ),
+                "input_schema": spec["inputSchema"].get("json", spec["inputSchema"]),
             }
             for spec in tool_specs
         ]
@@ -89,9 +87,10 @@ def _anthropic_params(
         elif "any" in tool_choice:
             params["tool_choice"] = {"type": "any"}
         else:
+            forced = cast(ToolChoiceToolDict, tool_choice)
             params["tool_choice"] = {
                 "type": "tool",
-                "name": tool_choice["tool"]["name"],
+                "name": forced["tool"]["name"],
             }
     params.update(extra_params)
     return params
@@ -124,9 +123,7 @@ def _anthropic_content_block(block: Mapping[str, Any]) -> dict[str, object]:
             "type": "tool_result",
             "tool_use_id": tool_result["toolUseId"],
             "content": [
-                {"type": "text", "text": block["text"]}
-                if "text" in block
-                else block
+                {"type": "text", "text": block["text"]} if "text" in block else block
                 for block in tool_result["content"]
             ],
         }

@@ -79,7 +79,7 @@ def _decode_reasoning_item(signature: str) -> ResponsesReasoningItem:
         standard = encoded.translate(str.maketrans("-_", "+/"))
         payload = base64.b64decode(standard.encode("ascii"), validate=True)
         value = json.loads(payload.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, binascii.Error):
+    except ValueError, UnicodeDecodeError, binascii.Error:
         raise ValueError("invalid reasoning signature") from None
     try:
         return ResponsesReasoningItem.model_validate(value)

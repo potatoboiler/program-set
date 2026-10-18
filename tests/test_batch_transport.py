@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import anthropic
 import httpx2
@@ -135,9 +135,7 @@ class BatchTransportTests(unittest.TestCase):
         self.transport.enqueue(request(), request_id="durable", metadata={"item": "42"})
         self.transport.flush()
         self.client.batch = BatchInfo("msgbatch_test", "ended")
-        self.client.results = [
-            {"custom_id": "durable", "result": {"type": "canceled"}}
-        ]
+        self.client.results = [{"custom_id": "durable", "result": {"type": "canceled"}}]
         self.transport.poll("msgbatch_test")
         self.transport.close()
 
@@ -209,7 +207,8 @@ class BatchTransportTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             self.transport.enqueue(
-                ["not a mapping"], request_id="not-mapping"  # type: ignore[arg-type]
+                ["not a mapping"],
+                request_id="not-mapping",  # type: ignore[arg-type]
             )
         with self.assertRaises(TypeError):
             self.transport.enqueue(
@@ -246,9 +245,7 @@ class BatchTransportTests(unittest.TestCase):
         for request_id, params, custom_id in cases:
             with self.subTest(request_id=request_id):
                 sdk_client = SDKClient()
-                transport = BatchTransport(
-                    AnthropicBatchClient(sdk_client), ":memory:"
-                )
+                transport = BatchTransport(AnthropicBatchClient(sdk_client), ":memory:")
                 try:
                     transport.enqueue(
                         params, request_id=request_id, custom_id=custom_id
@@ -287,9 +284,7 @@ class BatchTransportTests(unittest.TestCase):
         self.transport.enqueue(request(), request_id="known")
         self.transport.flush()
         self.client.batch = BatchInfo("msgbatch_test", "ended")
-        self.client.results = [
-            {"custom_id": "other", "result": {"type": "canceled"}}
-        ]
+        self.client.results = [{"custom_id": "other", "result": {"type": "canceled"}}]
         with self.assertRaises(BatchProtocolError):
             self.transport.poll("msgbatch_test")
 
@@ -349,9 +344,7 @@ class BatchTransportTests(unittest.TestCase):
         self.assertEqual(
             len(
                 list(
-                    adapter.iter_batch_results(
-                        "remote-id", expected_custom_ids=("id",)
-                    )
+                    adapter.iter_batch_results("remote-id", expected_custom_ids=("id",))
                 )
             ),
             1,

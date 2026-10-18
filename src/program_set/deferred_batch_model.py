@@ -11,10 +11,9 @@ import hashlib
 import json
 import threading
 from collections.abc import AsyncGenerator, Mapping
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel
-
 from strands.agent.agent_metadata import AgentMetadata
 from strands.interrupt import Interrupt, InterruptException
 from strands.models import Model
@@ -58,7 +57,7 @@ class DeferredBatchModel(Model):
         prompt: Messages,
         system_prompt: str | None = None,
         **kwargs: Any,
-    ) -> AsyncGenerator[dict[str, Any], None]:
+    ) -> AsyncGenerator[dict[str, Any]]:
         if False:
             yield {}
         raise NotImplementedError("structured output is not supported by batch models")
@@ -77,7 +76,7 @@ class DeferredBatchModel(Model):
         cancel_signal: threading.Event | None = None,
         agent_metadata: AgentMetadata | None = None,
         **kwargs: Any,
-    ) -> AsyncGenerator[StreamEvent, None]:
+    ) -> AsyncGenerator[StreamEvent]:
         # These are Strands runtime state, not provider request fields. Batch
         # requests carry the complete conversation and do not stream cache points.
         del model_state, dynamic_trailing_blocks
@@ -157,17 +156,20 @@ def message_events(message: Mapping[str, Any]) -> list[StreamEvent]:
             start = {}
         elif block["type"] == "tool_use":
             delta = {"toolUse": {"input": canonical_json(block["input"])}}
-            start = {
-                "toolUse": {"name": block["name"], "toolUseId": block["id"]}
-            }
+            start = {"toolUse": {"name": block["name"], "toolUseId": block["id"]}}
         else:
-            raise AssertionError(f"unsupported normalized batch response block: {block!r}")
+            raise AssertionError(
+                f"unsupported normalized batch response block: {block!r}"
+            )
         events.extend(
-            [
-                {"contentBlockStart": {"start": start}},
-                {"contentBlockDelta": {"delta": delta}},
-                {"contentBlockStop": {}},
-            ]
+            cast(
+                list[StreamEvent],
+                [
+                    {"contentBlockStart": {"start": start}},
+                    {"contentBlockDelta": {"delta": delta}},
+                    {"contentBlockStop": {}},
+                ],
+            )
         )
     events.append({"messageStop": {"stopReason": message["stop_reason"]}})
     return events

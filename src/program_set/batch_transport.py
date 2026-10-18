@@ -15,8 +15,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol, TypedDict, cast
-
+from typing import Literal, Protocol, Self, TypedDict, cast
 
 RequestStatus = Literal[
     "queued",
@@ -194,9 +193,7 @@ class BatchTransport:
         self._lock = threading.RLock()
         database_path = str(Path(database).expanduser())
         if database_path != ":memory:":
-            Path(database_path).resolve().parent.mkdir(
-                parents=True, exist_ok=True
-            )
+            Path(database_path).resolve().parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(database_path, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
@@ -435,9 +432,7 @@ class BatchTransport:
         if row is None:
             raise UnknownRequestError(f"request_id {request_id!r} is not registered")
         result = (
-            json.loads(row["result_json"])
-            if row["result_json"] is not None
-            else None
+            json.loads(row["result_json"]) if row["result_json"] is not None else None
         )
         return RequestRecord(
             request_id=str(row["request_id"]),
@@ -490,7 +485,7 @@ class BatchTransport:
         with self._lock:
             self._connection.close()
 
-    def __enter__(self) -> BatchTransport:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -539,9 +534,10 @@ def _validated_params(params: Mapping[str, object]) -> dict[str, object]:
 
 def _validate_anthropic_request(request: BatchRequestEnvelope) -> None:
     custom_id = request.get("custom_id")
-    if not isinstance(custom_id, str) or re.fullmatch(
-        r"[A-Za-z0-9_-]{1,64}", custom_id
-    ) is None:
+    if (
+        not isinstance(custom_id, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", custom_id) is None
+    ):
         raise ValueError(
             "Anthropic custom_id must contain 1-64 ASCII letters, digits, "
             "underscores, or hyphens"

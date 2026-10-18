@@ -34,9 +34,7 @@ class FakeAnthropicBatchClient:
         self.submissions: list[list[BatchRequestEnvelope]] = []
         self._batches: dict[str, tuple[str, list[object]]] = {}
 
-    def validate_requests(
-        self, requests: Sequence[BatchRequestEnvelope]
-    ) -> None:
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
         return None
 
     def create_batch(
@@ -62,7 +60,9 @@ class FakeAnthropicBatchClient:
         self._batches[batch_id] = ("ended", results)
 
 
-def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Path) -> None:
+def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
+    tmp_path: Path,
+) -> None:
     assert version("strands-agents") == "1.61.1"
     database = tmp_path / "batches.sqlite"
     client = FakeAnthropicBatchClient()
@@ -242,9 +242,7 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(tmp_path: Pat
         ]
         assert any("toolUse" in block for block in history[1]["content"])
         assert any("toolResult" in block for block in history[2]["content"])
-        assert history[3]["content"] == [
-            {"text": "The lookup returned sample-result."}
-        ]
+        assert history[3]["content"] == [{"text": "The lookup returned sample-result."}]
         assert completed.interrupts is None or completed.interrupts == []
         final_snapshot = final_agent.take_snapshot(preset="session")
         assert final_snapshot.data["interrupt_state"]["activated"] is False

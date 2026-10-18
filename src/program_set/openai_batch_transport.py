@@ -26,8 +26,7 @@ from program_set.openai_responses_request import (
     _encode_reasoning_item,
 )
 
-
-_ENDPOINT = "/v1/responses"
+_ENDPOINT: Literal["/v1/responses"] = "/v1/responses"
 _TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled", "canceled"}
 _BATCH_FAILURE_STATUSES = {"failed", "expired", "cancelled", "canceled"}
 
@@ -69,9 +68,7 @@ class OpenAIBatchClient:
         self._client = cast(_OpenAIClient, client)
         self._retrieved: dict[str, object] = {}
 
-    def validate_requests(
-        self, requests: Sequence[BatchRequestEnvelope]
-    ) -> object:
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> object:
         if not requests:
             raise ValueError("an OpenAI batch must contain at least one request")
         lines: list[OpenAIResponsesBatchLine] = []

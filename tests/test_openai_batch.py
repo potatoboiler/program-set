@@ -15,8 +15,8 @@ from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
 
 from program_set.batch_transport import BatchInfo, BatchProtocolError, BatchTransport
-from program_set.openai_responses_batch_model import OpenAIBatchBackedModel
 from program_set.openai_batch_transport import OpenAIBatchClient
+from program_set.openai_responses_batch_model import OpenAIBatchBackedModel
 
 
 class FakeFiles:
@@ -281,9 +281,7 @@ def test_failed_batch_recovers_missing_request_results(
 ) -> None:
     sdk_client = FakeOpenAIClient()
     database = tmp_path / "batch-errors.sqlite"
-    transport = BatchTransport(
-        OpenAIBatchClient(sdk_client), database
-    )
+    transport = BatchTransport(OpenAIBatchClient(sdk_client), database)
     try:
         first = transport.enqueue(
             _request("first"), request_id="first-request", custom_id="first"
@@ -497,9 +495,7 @@ def test_openai_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         assert "model_state" not in second_input["body"]
         input_items = second_input["body"]["input"]
         assert any(item.get("type") == "function_call" for item in input_items)
-        assert any(
-            item.get("type") == "function_call_output" for item in input_items
-        )
+        assert any(item.get("type") == "function_call_output" for item in input_items)
 
         sdk_client.batches.complete(
             second_batch.batch_id,
@@ -548,7 +544,9 @@ def test_openai_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
             "assistant",
         ]
         assert any("toolUse" in block for block in final_agent.messages[1]["content"])
-        assert any("toolResult" in block for block in final_agent.messages[2]["content"])
+        assert any(
+            "toolResult" in block for block in final_agent.messages[2]["content"]
+        )
         assert final_agent.messages[3]["content"] == [
             {"text": "The lookup returned sample-result."}
         ]
@@ -568,9 +566,7 @@ def test_reasoning_item_round_trips_opaquely_before_function_call(
     reasoning_item = {
         "id": "rs_fake_reasoning",
         "type": "reasoning",
-        "summary": [
-            {"type": "summary_text", "text": "summary canary with spaces"}
-        ],
+        "summary": [{"type": "summary_text", "text": "summary canary with spaces"}],
         "content": [
             {"type": "reasoning_text", "text": "chain of thought canary with spaces"}
         ],
@@ -582,9 +578,10 @@ def test_reasoning_item_round_trips_opaquely_before_function_call(
         tmp_path, [reasoning_item, _function_call_item()]
     )
 
-    assert [
-        block["type"] for block in first_result["message"]["content"]
-    ] == ["reasoning", "tool_use"]
+    assert [block["type"] for block in first_result["message"]["content"]] == [
+        "reasoning",
+        "tool_use",
+    ]
     # The transport result keeps only the opaque signature, never the text.
     serialized_result = json.dumps(first_result)
     assert "summary canary with spaces" not in serialized_result
@@ -611,9 +608,9 @@ def test_tool_cycle_without_reasoning_item_has_no_reasoning_input(
         tmp_path, [_function_call_item()]
     )
 
-    assert [
-        block["type"] for block in first_result["message"]["content"]
-    ] == ["tool_use"]
+    assert [block["type"] for block in first_result["message"]["content"]] == [
+        "tool_use"
+    ]
     assert all(item.get("type") != "reasoning" for item in second_input)
     assert [item.get("type") for item in second_input if "type" in item] == [
         "function_call",
@@ -663,9 +660,7 @@ def test_reasoning_input_item_schema_rejects_extra_fields() -> None:
         )
 
 
-@pytest.mark.parametrize(
-    "model_state", [{}, {"response_id": "resp_must_not_leak"}]
-)
+@pytest.mark.parametrize("model_state", [{}, {"response_id": "resp_must_not_leak"}])
 def test_strands_model_state_never_reaches_responses_jsonl(
     tmp_path: Path, model_state: dict[str, Any]
 ) -> None:
@@ -685,9 +680,7 @@ def test_strands_model_state_never_reaches_responses_jsonl(
         assert result.stop_reason == "interrupt"
 
         transport.flush()
-        input_line = json.loads(
-            sdk_client.files.uploads[0]["content"].splitlines()[0]
-        )
+        input_line = json.loads(sdk_client.files.uploads[0]["content"].splitlines()[0])
         body = input_line["body"]
         assert "model_state" not in body
         assert body == {
@@ -773,9 +766,7 @@ def test_unsupported_responses_fields_are_rejected_before_upload(
 
 def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> None:
     sdk_client = FakeOpenAIClient()
-    transport = BatchTransport(
-        OpenAIBatchClient(sdk_client), ":memory:"
-    )
+    transport = BatchTransport(OpenAIBatchClient(sdk_client), ":memory:")
     try:
         model = OpenAIBatchBackedModel(
             transport, agent_id="unsupported", model_id="gpt-4o-mini-test"
@@ -900,9 +891,7 @@ def _run_tool_cycle_to_second_request(
 
         second_batch = transport.flush()
         assert second_batch is not None
-        second_line = json.loads(
-            sdk_client.files.uploads[1]["content"].splitlines()[0]
-        )
+        second_line = json.loads(sdk_client.files.uploads[1]["content"].splitlines()[0])
         return dict(first_result.result), second_line["body"]["input"], tool_calls
     finally:
         transport.close()
@@ -926,9 +915,7 @@ def _text_response(text: str) -> dict[str, object]:
                 "id": "msg_fake_text",
                 "type": "message",
                 "role": "assistant",
-                "content": [
-                    {"type": "output_text", "text": text, "annotations": []}
-                ],
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
         ],
     }
@@ -953,9 +940,7 @@ def _tool_response() -> dict[str, object]:
     }
 
 
-def _output_line(
-    custom_id: str, completion: dict[str, object]
-) -> dict[str, object]:
+def _output_line(custom_id: str, completion: dict[str, object]) -> dict[str, object]:
     return {
         "custom_id": custom_id,
         "response": {
