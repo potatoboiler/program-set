@@ -12,8 +12,8 @@ from program_set.batch_transport import (
     AnthropicBatchClient,
     BatchInfo,
     BatchProtocolError,
+    BatchRequestEnvelope,
     BatchTransport,
-    MessagesBatchRequest,
     RequestConflictError,
     SubmissionUncertainError,
 )
@@ -29,12 +29,18 @@ def request(text: str = "hello") -> dict[str, object]:
 
 class FakeBatchClient:
     def __init__(self) -> None:
-        self.submissions: list[list[MessagesBatchRequest]] = []
+        self.submissions: list[list[BatchRequestEnvelope]] = []
         self.batch = BatchInfo("msgbatch_test", "in_progress")
         self.results: list[object] = []
         self.fail_create = False
 
-    def create_batch(self, requests: Sequence[MessagesBatchRequest]) -> BatchInfo:
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
+        return None
+
+    def create_batch(
+        self, requests: Sequence[BatchRequestEnvelope], *, validated: object
+    ) -> BatchInfo:
+        del validated
         self.submissions.append(list(requests))
         if self.fail_create:
             raise TimeoutError("simulated lost response")
@@ -44,7 +50,10 @@ class FakeBatchClient:
         assert batch_id == self.batch.batch_id
         return self.batch
 
-    def iter_batch_results(self, batch_id: str) -> list[object]:
+    def iter_batch_results(
+        self, batch_id: str, *, expected_custom_ids: Sequence[str]
+    ) -> list[object]:
+        del expected_custom_ids
         assert batch_id == self.batch.batch_id
         return self.results
 
@@ -183,27 +192,73 @@ class BatchTransportTests(unittest.TestCase):
                 request("different"), request_id="same", metadata={"source": "one"}
             )
 
-    def test_anthropic_custom_id_and_unsupported_params_are_rejected(self) -> None:
-        for index, custom_id in enumerate(
-            ("", "contains.dot", "has space", "x" * 65, "é")
-        ):
-            with self.subTest(custom_id=custom_id), self.assertRaises(ValueError):
+    def test_envelope_ids_and_opaque_serializable_params(self) -> None:
+        for id_name in ("request_id", "custom_id"):
+            with self.subTest(id_name=id_name), self.assertRaises(ValueError):
                 self.transport.enqueue(
-                    request(), request_id=f"invalid-{index}", custom_id=custom_id
+                    {"provider-specific": {"opaque": True}},
+                    **{id_name: " "},
                 )
 
         accepted = self.transport.enqueue(
-            request(), request_id="valid", custom_id="a" * 64
+            {"provider-specific": {"stream": True, "speed": "fast"}},
+            request_id="opaque-request",
+            custom_id="provider.id/opaque",
         )
-        self.assertEqual(accepted.custom_id, "a" * 64)
+        self.assertEqual(accepted.custom_id, "provider.id/opaque")
 
-        for unsupported in ({"stream": True}, {"speed": "fast"}):
-            params = {**request(), **unsupported}
-            with self.subTest(params=unsupported), self.assertRaises(ValueError):
-                self.transport.enqueue(
-                    params,
-                    request_id=f"unsupported-{len(unsupported)}-{next(iter(unsupported))}",
+        with self.assertRaises(TypeError):
+            self.transport.enqueue(
+                ["not a mapping"], request_id="not-mapping"  # type: ignore[arg-type]
+            )
+        with self.assertRaises(TypeError):
+            self.transport.enqueue(
+                {"not-json": object()}, request_id="not-serializable"
+            )
+
+    def test_anthropic_validation_fails_before_submission(self) -> None:
+        class Batches:
+            def __init__(self) -> None:
+                self.sent: list[Sequence[BatchRequestEnvelope]] = []
+
+            def create(self, *, requests: Sequence[BatchRequestEnvelope]) -> object:
+                self.sent.append(requests)
+                return {"id": "remote-id", "processing_status": "in_progress"}
+
+            def retrieve(self, batch_id: str) -> object:
+                return {"id": batch_id, "processing_status": "ended"}
+
+            def results(self, batch_id: str) -> list[object]:
+                return []
+
+        class Messages:
+            def __init__(self) -> None:
+                self.batches = Batches()
+
+        class SDKClient:
+            def __init__(self) -> None:
+                self.messages = Messages()
+
+        cases = (
+            ("bad-payload", {**request(), "stream": True}, "valid-id"),
+            ("bad-id", request(), "contains.dot"),
+        )
+        for request_id, params, custom_id in cases:
+            with self.subTest(request_id=request_id):
+                sdk_client = SDKClient()
+                transport = BatchTransport(
+                    AnthropicBatchClient(sdk_client), ":memory:"
                 )
+                try:
+                    transport.enqueue(
+                        params, request_id=request_id, custom_id=custom_id
+                    )
+                    with self.assertRaises(ValueError):
+                        transport.flush()
+                    self.assertEqual(transport.get_request(request_id).status, "queued")
+                    self.assertEqual(sdk_client.messages.batches.sent, [])
+                finally:
+                    transport.close()
 
     def test_real_sdk_batch_create_uses_zero_retries(self) -> None:
         attempts = 0
@@ -220,15 +275,10 @@ class BatchTransportTests(unittest.TestCase):
         sdk_client = anthropic.Anthropic(api_key="test-only", http_client=http_client)
         try:
             adapter = AnthropicBatchClient(sdk_client)
+            requests = [{"custom_id": "sdk-test", "params": request()}]
+            validated = adapter.validate_requests(requests)
             with self.assertRaises(anthropic.APIStatusError):
-                adapter.create_batch(
-                    [
-                        {
-                            "custom_id": "sdk-test",
-                            "params": request(),
-                        }
-                    ]
-                )
+                adapter.create_batch(requests, validated=validated)
             self.assertEqual(attempts, 1)
         finally:
             sdk_client.close()
@@ -266,9 +316,9 @@ class BatchTransportTests(unittest.TestCase):
     def test_anthropic_adapter_calls_sdk_batch_resources(self) -> None:
         class Batches:
             def __init__(self) -> None:
-                self.sent: list[MessagesBatchRequest] = []
+                self.sent: list[BatchRequestEnvelope] = []
 
-            def create(self, *, requests: list[MessagesBatchRequest]) -> object:
+            def create(self, *, requests: list[BatchRequestEnvelope]) -> object:
                 self.sent = requests
                 return {"id": "remote-id", "processing_status": "in_progress"}
 
@@ -288,11 +338,24 @@ class BatchTransportTests(unittest.TestCase):
 
         sdk_client = SDKClient()
         adapter = AnthropicBatchClient(sdk_client)
-        payload: MessagesBatchRequest = {"custom_id": "id", "params": request()}
-        self.assertEqual(adapter.create_batch([payload]).batch_id, "remote-id")
+        payload: BatchRequestEnvelope = {"custom_id": "id", "params": request()}
+        validated = adapter.validate_requests([payload])
+        self.assertEqual(
+            adapter.create_batch([payload], validated=validated).batch_id,
+            "remote-id",
+        )
         self.assertEqual(sdk_client.messages.batches.sent, [payload])
         self.assertEqual(adapter.retrieve_batch("remote-id").processing_status, "ended")
-        self.assertEqual(len(list(adapter.iter_batch_results("remote-id"))), 1)
+        self.assertEqual(
+            len(
+                list(
+                    adapter.iter_batch_results(
+                        "remote-id", expected_custom_ids=("id",)
+                    )
+                )
+            ),
+            1,
+        )
 
 
 if __name__ == "__main__":

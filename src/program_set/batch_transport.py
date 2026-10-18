@@ -1,4 +1,4 @@
-"""A small, app-owned transport for Anthropic Message Batches.
+"""A small, app-owned transport for provider batch requests.
 
 This module stores only batch request payloads and transport metadata/results. It
 does not read or persist Strands conversation or graph state.
@@ -30,8 +30,8 @@ RequestStatus = Literal[
 ]
 
 
-class MessagesBatchRequest(TypedDict):
-    """One request in Anthropic's ``messages.batches.create`` payload."""
+class BatchRequestEnvelope(TypedDict):
+    """Correlation envelope around an opaque provider-specific request payload."""
 
     custom_id: str
     params: dict[str, object]
@@ -62,17 +62,26 @@ class RequestRecord:
 
 
 class BatchClient(Protocol):
-    """The transport-facing interface, intentionally easy to fake in tests."""
+    """Transport adapter with an opaque, reusable provider preflight result."""
 
-    def create_batch(self, requests: Sequence[MessagesBatchRequest]) -> BatchInfo: ...
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> object: ...
+
+    def create_batch(
+        self,
+        requests: Sequence[BatchRequestEnvelope],
+        *,
+        validated: object,
+    ) -> BatchInfo: ...
 
     def retrieve_batch(self, batch_id: str) -> BatchInfo: ...
 
-    def iter_batch_results(self, batch_id: str) -> Iterable[object]: ...
+    def iter_batch_results(
+        self, batch_id: str, *, expected_custom_ids: Sequence[str]
+    ) -> Iterable[object]: ...
 
 
 class _AnthropicBatchesResource(Protocol):
-    def create(self, *, requests: Sequence[MessagesBatchRequest]) -> object: ...
+    def create(self, *, requests: Sequence[BatchRequestEnvelope]) -> object: ...
 
     def retrieve(self, batch_id: str) -> object: ...
 
@@ -101,7 +110,14 @@ class AnthropicBatchClient:
     def __init__(self, client: object) -> None:
         self._client = cast(_AnthropicSDKClient, client)
 
-    def create_batch(self, requests: Sequence[MessagesBatchRequest]) -> BatchInfo:
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
+        for request in requests:
+            _validate_anthropic_request(request)
+
+    def create_batch(
+        self, requests: Sequence[BatchRequestEnvelope], *, validated: object
+    ) -> BatchInfo:
+        del validated
         with_options = getattr(self._client, "with_options", None)
         if callable(with_options):
             # A POST retry after a timeout could create duplicate remote work.
@@ -118,7 +134,10 @@ class AnthropicBatchClient:
         response = self._batch_resource().retrieve(batch_id)
         return _batch_info(response)
 
-    def iter_batch_results(self, batch_id: str) -> Iterable[object]:
+    def iter_batch_results(
+        self, batch_id: str, *, expected_custom_ids: Sequence[str]
+    ) -> Iterable[object]:
+        del expected_custom_ids
         return cast(Iterable[object], self._batch_resource().results(batch_id))
 
     def _batch_resource(self) -> _AnthropicBatchesResource:
@@ -146,7 +165,7 @@ class BatchProtocolError(BatchTransportError):
 
 
 class SubmissionUncertainError(BatchTransportError):
-    """Batch creation failed after it may have reached Anthropic.
+    """Batch creation failed after it may have reached the provider.
 
     Requests in ``submission_id`` are deliberately not automatically retried:
     a caller must establish that the create call was not accepted before
@@ -163,7 +182,7 @@ class SubmissionUncertainError(BatchTransportError):
 
 
 class BatchTransport:
-    """Queue and reconcile complete Anthropic Messages batch requests.
+    """Queue and reconcile complete provider batch requests.
 
     ``flush`` is the only submission trigger; callers choose when to call it.
     The SQLite file holds queued request payloads, correlation metadata, known
@@ -191,13 +210,12 @@ class BatchTransport:
         custom_id: str | None = None,
         metadata: Mapping[str, str] | None = None,
     ) -> EnqueuedRequest:
-        """Persist a complete Messages request and return its stable IDs.
+        """Persist an opaque provider request and return its stable IDs.
 
-        The payload must contain ``model``, ``max_tokens``, and ``messages``.
         If IDs are omitted, UUIDs are generated once and persisted. By default
         ``custom_id`` equals ``request_id``; supplying either ID lets callers
-        correlate results with their own durable work identifiers. Anthropic's
-        custom ID character and length constraints are checked before storage.
+        correlate results with their own durable work identifiers. Both IDs
+        must be non-empty; provider-specific ID constraints belong to adapters.
         Re-enqueueing identical data under the same request ID is idempotent.
         """
 
@@ -208,7 +226,6 @@ class BatchTransport:
             custom_id = request_id
         _validate_id(request_id, "request_id")
         _validate_id(custom_id, "custom_id")
-        _validate_custom_id(custom_id)
         if metadata is not None and not isinstance(metadata, Mapping):
             raise TypeError("metadata must be a mapping")
         request_metadata = dict(metadata or {})
@@ -277,13 +294,16 @@ class BatchTransport:
 
             submission_id = str(uuid.uuid4())
             request_ids = [str(row["request_id"]) for row in rows]
-            requests: list[MessagesBatchRequest] = [
+            requests: list[BatchRequestEnvelope] = [
                 {
                     "custom_id": str(row["custom_id"]),
                     "params": cast(dict[str, object], json.loads(row["params_json"])),
                 }
                 for row in rows
             ]
+            # Provider validation must fail before the durable state suggests
+            # that the create request may have reached the provider.
+            validated = self._client.validate_requests(requests)
             with self._connection:
                 self._connection.executemany(
                     "UPDATE requests SET status = 'submitting', submission_id = ? "
@@ -292,7 +312,7 @@ class BatchTransport:
                 )
 
             try:
-                batch = self._client.create_batch(requests)
+                batch = self._client.create_batch(requests, validated=validated)
                 _validate_batch_info(batch)
                 with self._connection:
                     self._connection.execute(
@@ -348,8 +368,17 @@ class BatchTransport:
             return batch
 
     def _persist_results(self, batch_id: str) -> None:
+        registered = {
+            str(row["custom_id"]): str(row["request_id"])
+            for row in self._connection.execute(
+                "SELECT request_id, custom_id FROM requests WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchall()
+        }
         results_by_custom_id: dict[str, tuple[str, str]] = {}
-        for response in self._client.iter_batch_results(batch_id):
+        for response in self._client.iter_batch_results(
+            batch_id, expected_custom_ids=tuple(registered)
+        ):
             custom_id = _field(response, "custom_id")
             result = _field(response, "result")
             if not isinstance(custom_id, str) or not custom_id:
@@ -374,13 +403,6 @@ class BatchTransport:
             )
 
         with self._connection:
-            registered = {
-                str(row["custom_id"]): str(row["request_id"])
-                for row in self._connection.execute(
-                    "SELECT request_id, custom_id FROM requests WHERE batch_id = ?",
-                    (batch_id,),
-                ).fetchall()
-            }
             for custom_id, (result_status, result_json) in results_by_custom_id.items():
                 request_id = registered.get(custom_id)
                 if request_id is None:
@@ -445,7 +467,7 @@ class BatchTransport:
         """Explicitly requeue one uncertain submission after non-acceptance is known.
 
         This operation updates the entire original create call together. It does
-        not query Anthropic or decide whether a retry is safe.
+        not query the provider or decide whether a retry is safe.
         """
 
         with self._lock, self._connection:
@@ -512,36 +534,44 @@ class BatchTransport:
 def _validated_params(params: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(params, Mapping):
         raise TypeError("params must be a mapping")
-    missing = {"model", "max_tokens", "messages"}.difference(params)
-    if missing:
-        raise ValueError(f"incomplete Messages request; missing {sorted(missing)!r}")
-    if not isinstance(params["model"], str) or not params["model"]:
-        raise ValueError("params['model'] must be a non-empty string")
-    if (
-        not isinstance(params["max_tokens"], int)
-        or isinstance(params["max_tokens"], bool)
-        or params["max_tokens"] < 1
-    ):
-        raise ValueError("params['max_tokens'] must be a positive integer")
-    if not isinstance(params["messages"], list) or not params["messages"]:
-        raise ValueError("params['messages'] must be a non-empty list")
-    if params.get("stream") is True:
-        raise ValueError("stream=True is not supported in Anthropic Message Batches")
-    if "speed" in params:
-        raise ValueError("the speed parameter is not supported in Anthropic Message Batches")
     return cast(dict[str, object], json.loads(_dump_json(dict(params))))
+
+
+def _validate_anthropic_request(request: BatchRequestEnvelope) -> None:
+    custom_id = request.get("custom_id")
+    if not isinstance(custom_id, str) or re.fullmatch(
+        r"[A-Za-z0-9_-]{1,64}", custom_id
+    ) is None:
+        raise ValueError(
+            "Anthropic custom_id must contain 1-64 ASCII letters, digits, "
+            "underscores, or hyphens"
+        )
+
+    params = request.get("params")
+    if not isinstance(params, Mapping):
+        raise TypeError("Anthropic request params must be a mapping")
+    model = params.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("Anthropic request model must be a non-empty string")
+    max_tokens = params.get("max_tokens")
+    if (
+        not isinstance(max_tokens, int)
+        or isinstance(max_tokens, bool)
+        or max_tokens < 1
+    ):
+        raise ValueError("Anthropic max_tokens must be a positive integer")
+    messages = params.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("Anthropic messages must be a non-empty list")
+    if params.get("stream") is True:
+        raise ValueError("stream=True is not supported in Anthropic batch requests")
+    if "speed" in params:
+        raise ValueError("speed is not supported in Anthropic batch requests")
 
 
 def _validate_id(value: str, name: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
-
-
-def _validate_custom_id(value: str) -> None:
-    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is None:
-        raise ValueError(
-            "custom_id must contain 1-64 ASCII letters, digits, underscores, or hyphens"
-        )
 
 
 def _batch_info(value: object) -> BatchInfo:
