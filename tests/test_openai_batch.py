@@ -7,12 +7,13 @@ import json
 from collections.abc import Sequence
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
+from strands.types.content import Messages
 
 from program_set.batch_transport import BatchInfo, BatchProtocolError, BatchTransport
 from program_set.openai_batch_transport import OpenAIBatchClient
@@ -21,7 +22,7 @@ from program_set.openai_responses_batch_model import OpenAIBatchBackedModel
 
 class FakeFiles:
     def __init__(self) -> None:
-        self.uploads: list[dict[str, object]] = []
+        self.uploads: list[dict[str, str]] = []
         self.contents: dict[str, str] = {}
         self.content_calls: list[str] = []
 
@@ -60,7 +61,7 @@ class FakeBatches:
         completion_window: str,
     ) -> object:
         batch_id = f"batch-{len(self.creates) + 1}"
-        params = {
+        params: dict[str, object] = {
             "input_file_id": input_file_id,
             "endpoint": endpoint,
             "completion_window": completion_window,
@@ -400,6 +401,7 @@ def test_openai_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         }
 
         first_batch = transport.flush()
+        assert first_batch is not None
         assert first_batch == BatchInfo("batch-1", "validating")
         first_input = json.loads(sdk_client.files.uploads[0]["content"].splitlines()[0])
         assert first_input["custom_id"] == first_record.custom_id
@@ -488,6 +490,7 @@ def test_openai_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         }
 
         second_batch = transport.flush()
+        assert second_batch is not None
         assert second_batch == BatchInfo("batch-2", "validating")
         second_input = json.loads(
             sdk_client.files.uploads[1]["content"].splitlines()[0]
@@ -578,7 +581,9 @@ def test_reasoning_item_round_trips_opaquely_before_function_call(
         tmp_path, [reasoning_item, _function_call_item()]
     )
 
-    assert [block["type"] for block in first_result["message"]["content"]] == [
+    first_message = cast(dict[str, object], first_result["message"])
+    first_blocks = cast(list[dict[str, object]], first_message["content"])
+    assert [block["type"] for block in first_blocks] == [
         "reasoning",
         "tool_use",
     ]
@@ -608,9 +613,9 @@ def test_tool_cycle_without_reasoning_item_has_no_reasoning_input(
         tmp_path, [_function_call_item()]
     )
 
-    assert [block["type"] for block in first_result["message"]["content"]] == [
-        "tool_use"
-    ]
+    first_message = cast(dict[str, object], first_result["message"])
+    first_blocks = cast(list[dict[str, object]], first_message["content"])
+    assert [block["type"] for block in first_blocks] == ["tool_use"]
     assert all(item.get("type") != "reasoning" for item in second_input)
     assert [item.get("type") for item in second_input if "type" in item] == [
         "function_call",
@@ -706,7 +711,7 @@ def test_runtime_state_does_not_change_openai_request_identity(
         with pytest.raises(InterruptException):
             await anext(
                 model.stream(
-                    [{"role": "user", "content": "hello"}],
+                    cast(Messages, [{"role": "user", "content": "hello"}]),
                     model_state=model_state,
                     dynamic_trailing_blocks=dynamic_trailing_blocks,
                 )
@@ -734,7 +739,7 @@ def test_unsupported_responses_fields_are_rejected_before_upload(
     }
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         _responses_params(
-            [{"role": "user", "content": "hello"}],
+            cast(Messages, [{"role": "user", "content": "hello"}]),
             None,
             None,
             None,
@@ -781,7 +786,10 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
 
         with pytest.raises(NotImplementedError, match="structured output"):
             _responses_params(
-                [{"role": "user", "content": [{"image": "not-supported"}]}],
+                cast(
+                    Messages,
+                    [{"role": "user", "content": [{"image": "not-supported"}]}],
+                ),
                 None,
                 None,
                 None,
@@ -791,7 +799,10 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
             )
         with pytest.raises(NotImplementedError, match="unsupported user content"):
             _responses_params(
-                [{"role": "user", "content": [{"image": "not-supported"}]}],
+                cast(
+                    Messages,
+                    [{"role": "user", "content": [{"image": "not-supported"}]}],
+                ),
                 None,
                 None,
                 None,

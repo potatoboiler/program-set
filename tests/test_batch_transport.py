@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any, cast
 
 import anthropic
 import httpx2
@@ -126,7 +127,9 @@ class BatchTransportTests(unittest.TestCase):
         second_record = self.transport.get_request(second.request_id)
         self.assertEqual(first_record.status, "succeeded")
         self.assertEqual(first_record.result_status, "succeeded")
-        self.assertEqual(first_record.result["message"]["id"], "msg_1")
+        assert first_record.result is not None
+        message = cast(dict[str, Any], first_record.result["message"])
+        self.assertEqual(message["id"], "msg_1")
         self.assertEqual(first_record.metadata, {"job": "alpha"})
         self.assertEqual(second_record.status, "errored")
         self.assertEqual(second_record.result_status, "errored")
@@ -193,10 +196,16 @@ class BatchTransportTests(unittest.TestCase):
     def test_envelope_ids_and_opaque_serializable_params(self) -> None:
         for id_name in ("request_id", "custom_id"):
             with self.subTest(id_name=id_name), self.assertRaises(ValueError):
-                self.transport.enqueue(
-                    {"provider-specific": {"opaque": True}},
-                    **{id_name: " "},
-                )
+                if id_name == "request_id":
+                    self.transport.enqueue(
+                        {"provider-specific": {"opaque": True}},
+                        request_id=" ",
+                    )
+                else:
+                    self.transport.enqueue(
+                        {"provider-specific": {"opaque": True}},
+                        custom_id=" ",
+                    )
 
         accepted = self.transport.enqueue(
             {"provider-specific": {"stream": True, "speed": "fast"}},
@@ -207,8 +216,8 @@ class BatchTransportTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             self.transport.enqueue(
-                ["not a mapping"],
-                request_id="not-mapping",  # type: ignore[arg-type]
+                cast(Any, ["not a mapping"]),
+                request_id="not-mapping",
             )
         with self.assertRaises(TypeError):
             self.transport.enqueue(
@@ -272,7 +281,9 @@ class BatchTransportTests(unittest.TestCase):
         sdk_client = anthropic.Anthropic(api_key="test-only", http_client=http_client)
         try:
             adapter = AnthropicBatchClient(sdk_client)
-            requests = [{"custom_id": "sdk-test", "params": request()}]
+            requests: list[BatchRequestEnvelope] = [
+                {"custom_id": "sdk-test", "params": request()}
+            ]
             validated = adapter.validate_requests(requests)
             with self.assertRaises(anthropic.APIStatusError):
                 adapter.create_batch(requests, validated=validated)
