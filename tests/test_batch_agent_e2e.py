@@ -1,4 +1,4 @@
-"""Single-agent proof of deferred Anthropic batch results across restarts.
+"""Agent and multi-agent proofs of deferred Anthropic batch results.
 
 Everything remote is deterministic and fake. In particular, the production
 adapter raises immediately while a request is pending; it never leaves a
@@ -881,6 +881,278 @@ def test_swarm_handoff_executes_next_agent_then_resumes_its_batch_request(
         transport.close()
 
 
+def test_agent_as_tool_child_resumes_from_parent_public_snapshot(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "agent-tool.sqlite")
+    try:
+
+        def build_parent() -> tuple[Agent, BatchBackedModel, BatchBackedModel]:
+            child_model = BatchBackedModel(
+                transport, agent_id="agent-tool-child", model_id="claude-test"
+            )
+            child = Agent(
+                model=child_model,
+                name="child",
+                description="Answer the request",
+            )
+            parent_model = BatchBackedModel(
+                transport, agent_id="agent-tool-parent", model_id="claude-test"
+            )
+            return (
+                Agent(model=parent_model, tools=[child.as_tool()]),
+                parent_model,
+                child_model,
+            )
+
+        parent, parent_model, child_model = build_parent()
+        first = parent("ask the child")
+        assert first.stop_reason == "interrupt"
+        parent_request_id = parent_model.queued_request_ids[0]
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        _complete_batch(
+            client,
+            transport,
+            [parent_request_id],
+            [
+                _tool_use_message(
+                    "child", "toolu_single_child", {"input": "answer this"}
+                )
+            ],
+        )
+        interrupted_child = parent(
+            ready_batch_interrupt_responses(first.interrupts or [], transport)
+        )
+        assert interrupted_child.stop_reason == "interrupt"
+        assert interrupted_child.interrupts
+        snapshot = _round_trip_snapshot(parent.take_snapshot(preset="session"))
+        child_request_id = child_model.queued_request_ids[-1]
+
+        assert transport.flush() == BatchInfo("msgbatch_fake_2", "in_progress")
+        child_payload = str(client.submissions[1][0]["params"]["messages"])
+        assert "answer this" in child_payload
+        _complete_batch(
+            client,
+            transport,
+            [child_request_id],
+            [_text_message("child answer")],
+        )
+
+        # Rebuild both agent definitions and restore only the parent's public
+        # snapshot; its snapshot owns the interrupted ephemeral child turn.
+        resumed_parent, resumed_model, resumed_child_model = build_parent()
+        resumed_parent.load_snapshot(snapshot)
+        resumed = resumed_parent(
+            ready_batch_interrupt_responses(
+                interrupted_child.interrupts or [], transport
+            )
+        )
+        assert resumed.stop_reason == "interrupt"
+        parent_followup_id = resumed_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_3", "in_progress")
+        parent_followup_payload = str(client.submissions[2][0]["params"]["messages"])
+        assert "child answer" in parent_followup_payload
+        _complete_batch(
+            client,
+            transport,
+            [parent_followup_id],
+            [_text_message("parent received the child answer")],
+        )
+        completed = resumed_parent(
+            ready_batch_interrupt_responses(resumed.interrupts or [], transport)
+        )
+        assert completed.stop_reason == "end_turn"
+
+        second = resumed_parent("ask a different independent child question")
+        assert second.stop_reason == "interrupt"
+        second_parent_request_id = resumed_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_4", "in_progress")
+        _complete_batch(
+            client,
+            transport,
+            [second_parent_request_id],
+            [
+                _tool_use_message(
+                    "child",
+                    "toolu_single_child_second",
+                    {"input": "independent child request"},
+                )
+            ],
+        )
+        second = resumed_parent(
+            ready_batch_interrupt_responses(second.interrupts or [], transport)
+        )
+        assert second.stop_reason == "interrupt"
+        second_child_request_id = resumed_child_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_5", "in_progress")
+        second_child_payload = str(client.submissions[4][0]["params"]["messages"])
+        assert "independent child request" in second_child_payload
+        assert "answer this" not in second_child_payload
+        assert "child answer" not in second_child_payload
+        _complete_batch(
+            client,
+            transport,
+            [second_child_request_id],
+            [_text_message("independent child answer")],
+        )
+        second = resumed_parent(
+            ready_batch_interrupt_responses(second.interrupts or [], transport)
+        )
+        assert second.stop_reason == "interrupt"
+        second_parent_followup = resumed_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_6", "in_progress")
+        second_parent_payload = str(client.submissions[5][0]["params"]["messages"])
+        assert "independent child answer" in second_parent_payload
+        _complete_batch(
+            client,
+            transport,
+            [second_parent_followup],
+            [_text_message("independent interaction completed")],
+        )
+        assert (
+            resumed_parent(
+                ready_batch_interrupt_responses(second.interrupts or [], transport)
+            ).stop_reason
+            == "end_turn"
+        )
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("reconstruct_at_grandchild_suspend", [False, True])
+def test_nested_agent_tools_resume_parent_child_and_grandchild(
+    tmp_path: Path, reconstruct_at_grandchild_suspend: bool
+) -> None:
+    client = FakeAnthropicBatchClient()
+    database = tmp_path / "nested-agents.sqlite"
+    transport = BatchTransport(client, database)
+    try:
+
+        def build_agents() -> tuple[
+            Agent, BatchBackedModel, BatchBackedModel, BatchBackedModel
+        ]:
+            grandchild_model = BatchBackedModel(
+                transport, agent_id="nested-grandchild", model_id="claude-test"
+            )
+            grandchild = Agent(
+                model=grandchild_model,
+                name="grandchild",
+                description="Do the final lookup",
+            )
+            child_model = BatchBackedModel(
+                transport, agent_id="nested-child", model_id="claude-test"
+            )
+            child = Agent(
+                model=child_model,
+                name="child",
+                description="Delegate to the grandchild",
+                tools=[grandchild.as_tool()],
+            )
+            parent_model = BatchBackedModel(
+                transport, agent_id="nested-parent", model_id="claude-test"
+            )
+            parent = Agent(model=parent_model, tools=[child.as_tool()])
+            return parent, parent_model, child_model, grandchild_model
+
+        parent, parent_model, child_model, grandchild_model = build_agents()
+
+        current = parent("complete a nested task")
+        assert current.stop_reason == "interrupt"
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        parent_request_id = parent_model.queued_request_ids[0]
+        _complete_batch(
+            client,
+            transport,
+            [parent_request_id],
+            [
+                _tool_use_message(
+                    "child", "toolu_parent_child", {"input": "task for child"}
+                )
+            ],
+        )
+        current = parent(
+            ready_batch_interrupt_responses(current.interrupts or [], transport)
+        )
+        assert current.stop_reason == "interrupt"
+
+        assert transport.flush() == BatchInfo("msgbatch_fake_2", "in_progress")
+        child_payload = str(client.submissions[1][0]["params"]["messages"])
+        assert "task for child" in child_payload
+        child_request_id = child_model.queued_request_ids[0]
+        _complete_batch(
+            client,
+            transport,
+            [child_request_id],
+            [
+                _tool_use_message(
+                    "grandchild",
+                    "toolu_child_grandchild",
+                    {"input": "task for grandchild"},
+                )
+            ],
+        )
+        current = parent(
+            ready_batch_interrupt_responses(current.interrupts or [], transport)
+        )
+        assert current.stop_reason == "interrupt"  # grandchild deferred at depth 3
+        snapshot = _round_trip_snapshot(parent.take_snapshot(preset="session"))
+
+        assert transport.flush() == BatchInfo("msgbatch_fake_3", "in_progress")
+        grandchild_payload = str(client.submissions[2][0]["params"]["messages"])
+        assert "task for grandchild" in grandchild_payload
+        grandchild_request_id = grandchild_model.queued_request_ids[0]
+        _complete_batch(
+            client,
+            transport,
+            [grandchild_request_id],
+            [_text_message("nested lookup complete")],
+        )
+        if reconstruct_at_grandchild_suspend:
+            transport.close()
+            transport = BatchTransport(client, database)
+            parent, parent_model, child_model, grandchild_model = build_agents()
+            parent.load_snapshot(snapshot)
+
+        current = parent(
+            ready_batch_interrupt_responses(current.interrupts or [], transport)
+        )
+        assert current.stop_reason == "interrupt"  # child continues after grandchild
+
+        assert transport.flush() == BatchInfo("msgbatch_fake_4", "in_progress")
+        child_followup_payload = str(client.submissions[3][0]["params"]["messages"])
+        assert "nested lookup complete" in child_followup_payload
+        child_followup_id = child_model.queued_request_ids[-1]
+        _complete_batch(
+            client,
+            transport,
+            [child_followup_id],
+            [_text_message("child completed")],
+        )
+        current = parent(
+            ready_batch_interrupt_responses(current.interrupts or [], transport)
+        )
+        assert current.stop_reason == "interrupt"  # parent continues after child tool
+
+        assert transport.flush() == BatchInfo("msgbatch_fake_5", "in_progress")
+        parent_followup_payload = str(client.submissions[4][0]["params"]["messages"])
+        assert "child completed" in parent_followup_payload
+        parent_followup_id = parent_model.queued_request_ids[-1]
+        _complete_batch(
+            client,
+            transport,
+            [parent_followup_id],
+            [_text_message("all levels completed")],
+        )
+        current = parent(
+            ready_batch_interrupt_responses(current.interrupts or [], transport)
+        )
+        assert current.stop_reason == "end_turn"
+        assert current.message["content"] == [{"text": "all levels completed"}]
+    finally:
+        transport.close()
+
+
 def test_ready_batch_interrupt_responses_validate_and_leave_other_interrupts_alone(
     tmp_path: Path,
 ) -> None:
@@ -1034,14 +1306,18 @@ def test_ready_batch_interrupt_responses_surface_uncertain_submission(
         transport.close()
 
 
-def _tool_use_message() -> NormalizedMessage:
+def _tool_use_message(
+    name: str = "lookup",
+    tool_use_id: str = "toolu_fake_lookup",
+    tool_input: dict[str, object] | None = None,
+) -> NormalizedMessage:
     return {
         "content": [
             {
                 "type": "tool_use",
-                "id": "toolu_fake_lookup",
-                "name": "lookup",
-                "input": {"query": "sample"},
+                "id": tool_use_id,
+                "name": name,
+                "input": tool_input if tool_input is not None else {"query": "sample"},
             }
         ],
         "stop_reason": "tool_use",
