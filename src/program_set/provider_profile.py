@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Literal
 
 ProviderName = Literal["anthropic", "openai"]
@@ -42,7 +43,26 @@ class ProviderProfile:
             raise TypeError("provider profile config must be a mapping")
         copied_config = dict(self.config)
         _reject_credential_fields(copied_config)
-        object.__setattr__(self, "config", copied_config)
+        if self.provider == "anthropic":
+            unknown = set(copied_config) - {"betas"}
+            if unknown:
+                raise ValueError(
+                    "unsupported Anthropic provider profile config keys: "
+                    f"{sorted(unknown)!r}"
+                )
+            betas = copied_config.get("betas")
+            if betas is not None and (
+                not isinstance(betas, Sequence)
+                or isinstance(betas, (str, bytes))
+                or any(not isinstance(beta, str) or not beta for beta in betas)
+            ):
+                raise ValueError(
+                    "Anthropic provider profile betas must be a sequence of "
+                    "non-empty strings"
+                )
+        elif copied_config:
+            raise ValueError("OpenAI provider profiles do not accept config keys")
+        object.__setattr__(self, "config", MappingProxyType(copied_config))
 
 
 def _reject_credential_fields(value: object) -> None:

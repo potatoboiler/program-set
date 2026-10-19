@@ -16,15 +16,40 @@ by itself.
 
 `BatchBackedModel` maps the tested Strands text/function-tool flow to Anthropic
 Messages and supports Anthropic threshold compaction. Enable it by configuring
-the transport client as
 `AnthropicBatchClient(client, betas=["compact-2026-01-12"])` and passing
 `context_management={"edits": [{"type": "compact_20260112"}]}` in model config
 or request parameters. Beta mode is explicit, not inferred from queued request
-contents; recreate the client with the same beta configuration after a restart.
-Compaction blocks are carried opaquely through Agent history and restored to
-their original Anthropic content/signature fields. On-demand compaction is not
-supported. `OpenAIBatchBackedModel` maps the supported text/function-tool subset
-to Responses and carries reasoning items opaquely across tool calls. OpenAI's
+contents. `ProviderProfile` durably stores this non-secret adapter config in
+SQLite, so restarts can rebuild the same adapter without inspecting request
+payloads. A typical setup saves a profile once, then on each start opens the
+transport without a client, loads the profile, builds the adapter, and binds it:
+
+```python
+profile = ProviderProfile(
+    "agent-provider", "anthropic", {"betas": ["compact-2026-01-12"]}
+)
+transport = BatchTransport(None, "batches.sqlite")
+transport.save_provider_profile(profile)  # initial setup; repeat only to update
+transport.set_client(
+    build_batch_client(profile, anthropic_client=application_anthropic_client)
+)
+
+# On restart, load the saved config before binding the injected SDK client:
+transport = BatchTransport(None, "batches.sqlite")
+profile = transport.get_provider_profile("agent-provider")
+transport.set_client(
+    build_batch_client(profile, anthropic_client=application_anthropic_client)
+)
+```
+
+Profiles accept adapter configuration only (Anthropic `betas`; no OpenAI
+options currently). Never put API keys or other credentials in a profile;
+credentials belong to application-owned SDK client construction and are not
+stored by the profile table or factory. Compaction blocks are carried opaquely
+through Agent history and restored to their original Anthropic
+content/signature fields. On-demand compaction is not supported.
+`OpenAIBatchBackedModel` maps the supported text/function-tool subset to
+Responses and carries reasoning items opaquely across tool calls. OpenAI's
 separate JSONL adapter validates its own Responses request shape. There is no
 universal request schema or cross-provider conversion layer. SDK clients are
 injected; constructing adapters makes no network calls.

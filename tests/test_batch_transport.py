@@ -12,7 +12,7 @@ import httpx2
 from batch_test_types import succeeded, successful_result
 
 from program_set.anthropic_batch import AnthropicBatchClient, _AnthropicSDKClient
-from program_set.batch_result import BatchResultError, parse_batch_result
+from program_set.batch_result import BatchResult, BatchResultError, parse_batch_result
 from program_set.batch_transport import (
     BatchInfo,
     BatchProtocolError,
@@ -32,7 +32,7 @@ def request(text: str = "hello") -> dict[str, object]:
     }
 
 
-def normalize_anthropic_result(value: object) -> object:
+def normalize_anthropic_result(value: object) -> BatchResult:
     adapter = AnthropicBatchClient(cast(_AnthropicSDKClient, object()))
     return adapter._normalize_result(value)
 

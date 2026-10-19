@@ -26,8 +26,8 @@ from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
 
-from program_set.anthropic_compaction import encode_compaction_signature
 from program_set.anthropic_batch import AnthropicBatchClient
+from program_set.anthropic_compaction import encode_compaction_signature
 from program_set.batch_model import BatchBackedModel
 from program_set.batch_result import (
     BatchResultEnvelope,

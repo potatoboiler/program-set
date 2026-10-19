@@ -15,7 +15,6 @@ from program_set.batch_result import (
     parse_compaction_block,
 )
 from program_set.batch_transport import (
-    BatchClient,
     BatchInfo,
     BatchProtocolError,
     BatchRequestEnvelope,
@@ -207,7 +206,9 @@ class AnthropicBatchClient:
         for response in responses:
             custom_id = field(response, "custom_id")
             if not isinstance(custom_id, str) or not custom_id:
-                raise BatchProtocolError("Anthropic batch result has no valid custom_id")
+                raise BatchProtocolError(
+                    "Anthropic batch result has no valid custom_id"
+                )
             yield {
                 "custom_id": custom_id,
                 "result": self._normalize_result(field(response, "result")),
@@ -233,7 +234,9 @@ class AnthropicBatchClient:
             content = field(message, "content")
             stop_reason = field(message, "stop_reason")
             if not isinstance(content, list):
-                raise BatchProtocolError("Anthropic result message content is not a list")
+                raise BatchProtocolError(
+                    "Anthropic result message content is not a list"
+                )
             try:
                 normalized_stop_reason = normalize_stop_reason(stop_reason)
             except BatchResultError:
@@ -247,7 +250,9 @@ class AnthropicBatchClient:
                     },
                 }
 
-            normalized_content = [self._normalize_content_block(block) for block in content]
+            normalized_content = [
+                self._normalize_content_block(block) for block in content
+            ]
             return {
                 "type": "succeeded",
                 "message": {
@@ -302,7 +307,9 @@ class AnthropicBatchClient:
             try:
                 return parse_compaction_block(jsonable(block))
             except BatchResultError as exc:
-                raise BatchProtocolError("Anthropic compaction block is malformed") from exc
+                raise BatchProtocolError(
+                    "Anthropic compaction block is malformed"
+                ) from exc
         raise BatchProtocolError(
             f"unsupported Anthropic result content block {block_type!r}"
         )

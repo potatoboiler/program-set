@@ -79,6 +79,17 @@ def test_profile_config_rejects_credentials_and_does_not_store_them(
     assert "never-persist-this" not in config_json
 
 
+def test_profile_accepts_only_non_secret_adapter_configuration() -> None:
+    with pytest.raises(ValueError, match="unsupported Anthropic.*config keys"):
+        ProviderProfile("messages-are-not-config", "anthropic", {"messages": []})
+    with pytest.raises(ValueError, match="unsupported Anthropic.*config keys"):
+        ProviderProfile("model-is-not-config", "anthropic", {"model": "claude"})
+    with pytest.raises(ValueError, match="do not accept config keys"):
+        ProviderProfile("openai-config", "openai", {"model": "gpt"})
+    with pytest.raises(ValueError, match="sequence of non-empty strings"):
+        ProviderProfile("bad-betas", "anthropic", {"betas": ["", "valid"]})
+
+
 def test_missing_and_malformed_provider_profiles_fail_clearly(
     tmp_path: Path,
 ) -> None:

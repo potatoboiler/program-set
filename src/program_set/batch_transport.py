@@ -151,14 +151,19 @@ class BatchTransport:
     def save_provider_profile(self, profile: ProviderProfile) -> None:
         """Insert or replace non-secret provider configuration by profile ID."""
 
-        config_json = _dump_json(dict(profile.config))
+        validated_profile = ProviderProfile(
+            profile_id=profile.profile_id,
+            provider=profile.provider,
+            config=profile.config,
+        )
+        config_json = _dump_json(dict(validated_profile.config))
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT INTO provider_profiles (profile_id, provider, config_json) "
                 "VALUES (?, ?, ?) "
                 "ON CONFLICT(profile_id) DO UPDATE SET "
                 "provider = excluded.provider, config_json = excluded.config_json",
-                (profile.profile_id, profile.provider, config_json),
+                (validated_profile.profile_id, validated_profile.provider, config_json),
             )
 
     def get_provider_profile(self, profile_id: str) -> ProviderProfile:
@@ -177,7 +182,7 @@ class BatchTransport:
         try:
             config = json.loads(row["config_json"])
             if not isinstance(config, Mapping):
-                raise ValueError("provider profile config is not an object")
+                raise TypeError("provider profile config is not an object")
             return ProviderProfile(
                 profile_id=str(row["profile_id"]),
                 provider=row["provider"],
