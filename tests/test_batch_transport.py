@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -21,6 +22,7 @@ from program_set.batch_transport import (
     SubmissionUncertainError,
     _AnthropicSDKClient,
 )
+from program_set.deferred_batch_model import message_events
 
 
 def request(text: str = "hello") -> dict[str, object]:
@@ -321,7 +323,7 @@ class BatchTransportTests(unittest.TestCase):
                 "type": "succeeded",
                 "message": {
                     "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
+                    "stop_reason": "stop_sequence",
                 },
             },
         )
@@ -335,6 +337,158 @@ class BatchTransportTests(unittest.TestCase):
                     },
                 }
             )
+
+    def test_anthropic_stop_reasons_normalize_and_replay_as_strands_reasons(
+        self,
+    ) -> None:
+        cases = (
+            ("end_turn", "end_turn"),
+            ("max_tokens", "max_tokens"),
+            ("stop_sequence", "stop_sequence"),
+            ("tool_use", "tool_use"),
+            ("pause_turn", "end_turn"),
+            ("refusal", "content_filtered"),
+            ("model_context_window_exceeded", "limit_total_tokens"),
+        )
+        for provider_reason, expected_reason in cases:
+            with self.subTest(provider_reason=provider_reason):
+                result = parse_batch_result(
+                    {
+                        "type": "succeeded",
+                        "message": {
+                            "content": [],
+                            "stop_reason": provider_reason,
+                        },
+                    }
+                )
+                assert result["type"] == "succeeded"
+                self.assertEqual(result["message"]["stop_reason"], expected_reason)
+                self.assertEqual(
+                    message_events(result["message"])[-1],
+                    {"messageStop": {"stopReason": expected_reason}},
+                )
+
+    def test_legacy_sqlite_row_preserves_stop_sequence(self) -> None:
+        enqueued = self.transport.enqueue(request(), request_id="legacy-stop-sequence")
+        legacy_result = {
+            "type": "succeeded",
+            "message": {
+                "id": "msg_legacy",
+                "model": "claude-legacy",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "stop_sequence",
+            },
+        }
+        with self.transport._connection:
+            self.transport._connection.execute(
+                "UPDATE requests SET status = 'succeeded', result_status = ?, "
+                "result_json = ? WHERE request_id = ?",
+                ("succeeded", json.dumps(legacy_result), enqueued.request_id),
+            )
+
+        record = self.transport.get_request(enqueued.request_id)
+
+        self.assertEqual(record.result_status, "succeeded")
+        self.assertEqual(
+            record.result,
+            {
+                "type": "succeeded",
+                "message": {
+                    "content": [{"type": "text", "text": "done"}],
+                    "stop_reason": "stop_sequence",
+                },
+            },
+        )
+
+    def test_anthropic_nonstandard_stop_reasons_persist_per_request(self) -> None:
+        raw_reasons = {
+            "refusal": "content_filtered",
+            "pause_turn": "end_turn",
+            "model_context_window_exceeded": "limit_total_tokens",
+            "stop_sequence": "stop_sequence",
+            "unknown_reason": None,
+        }
+
+        class Batches:
+            def __init__(self) -> None:
+                self.status = "in_progress"
+                self.raw_results: list[object] = []
+
+            def create(self, *, requests: Sequence[BatchRequestEnvelope]) -> object:
+                return {"id": "reason-batch", "processing_status": self.status}
+
+            def retrieve(self, batch_id: str) -> object:
+                return {"id": batch_id, "processing_status": self.status}
+
+            def results(self, batch_id: str) -> list[object]:
+                return self.raw_results
+
+        class Messages:
+            def __init__(self) -> None:
+                self.batches = Batches()
+
+        class SDKClient:
+            def __init__(self) -> None:
+                self.messages = Messages()
+
+            def with_options(self, *, max_retries: int) -> SDKClient:
+                assert max_retries == 0
+                return self
+
+        sdk_client = SDKClient()
+        batches = sdk_client.messages.batches
+        for provider_reason in raw_reasons:
+            batches.raw_results.append(
+                {
+                    "custom_id": provider_reason,
+                    "result": {
+                        "type": "succeeded",
+                        "message": {
+                            "content": [{"type": "text", "text": provider_reason}],
+                            "stop_reason": provider_reason,
+                        },
+                    },
+                }
+            )
+        transport = BatchTransport(
+            AnthropicBatchClient(sdk_client), self.database.with_name("reasons.sqlite")
+        )
+        try:
+            for provider_reason in raw_reasons:
+                transport.enqueue(
+                    request(provider_reason),
+                    request_id=f"request-{provider_reason}",
+                    custom_id=provider_reason,
+                )
+            transport.flush()
+            batches.status = "ended"
+
+            transport.poll("reason-batch")
+
+            for provider_reason, expected_reason in raw_reasons.items():
+                record = transport.get_request(f"request-{provider_reason}")
+                if expected_reason is None:
+                    self.assertEqual(record.status, "errored")
+                    self.assertEqual(record.result_status, "errored")
+                    self.assertEqual(
+                        record.result,
+                        {
+                            "type": "errored",
+                            "error": {
+                                "code": "unsupported_stop_reason",
+                                "message": (
+                                    "Anthropic batch result has an unsupported stop reason"
+                                ),
+                            },
+                        },
+                    )
+                    continue
+                self.assertEqual(record.status, "succeeded")
+                result = successful_result(record.result)
+                self.assertEqual(result["message"]["stop_reason"], expected_reason)
+        finally:
+            transport.close()
 
     def test_restart_marks_interrupted_submissions_uncertain(self) -> None:
         enqueued = self.transport.enqueue(request(), request_id="interrupted")
@@ -376,8 +530,15 @@ class BatchTransportTests(unittest.TestCase):
                             "type": "succeeded",
                             "message": {
                                 "id": "provider-id",
-                                "content": [{"type": "text", "text": "ready"}],
-                                "stop_reason": "end_turn",
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_lookup",
+                                        "name": "lookup",
+                                        "input": {"query": "sample"},
+                                    }
+                                ],
+                                "stop_reason": "tool_use",
                                 "usage": {"input_tokens": 3},
                             },
                         },
@@ -414,8 +575,15 @@ class BatchTransportTests(unittest.TestCase):
                     "result": {
                         "type": "succeeded",
                         "message": {
-                            "content": [{"type": "text", "text": "ready"}],
-                            "stop_reason": "end_turn",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_lookup",
+                                    "name": "lookup",
+                                    "input": {"query": "sample"},
+                                }
+                            ],
+                            "stop_reason": "tool_use",
                         },
                     },
                 }

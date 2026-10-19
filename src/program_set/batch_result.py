@@ -5,7 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Literal, TypedDict
 
-type StopReason = Literal["end_turn", "tool_use", "max_tokens"]
+type StopReason = Literal[
+    "end_turn",
+    "tool_use",
+    "max_tokens",
+    "stop_sequence",
+    "content_filtered",
+    "limit_total_tokens",
+]
 type BatchResultType = Literal["succeeded", "errored", "canceled", "expired"]
 
 
@@ -68,6 +75,35 @@ class BatchResultError(ValueError):
     """A provider or stored result is not in the normalized result format."""
 
 
+def normalize_stop_reason(value: object) -> StopReason:
+    """Map supported Anthropic reasons to Strands stop reasons.
+
+    ``pause_turn`` maps to ``end_turn`` because this deferred response is
+    complete for the current invocation. ``refusal`` maps to
+    ``content_filtered``, and ``model_context_window_exceeded`` maps to
+    ``limit_total_tokens``. ``stop_sequence`` is preserved because Strands
+    accepts it as a distinct stop reason.
+    """
+
+    if value == "end_turn" or value == "pause_turn":
+        return "end_turn"
+    if value == "tool_use":
+        return "tool_use"
+    if value == "max_tokens":
+        return "max_tokens"
+    if value == "stop_sequence":
+        return "stop_sequence"
+    if value == "refusal":
+        return "content_filtered"
+    if value == "content_filtered":
+        return "content_filtered"
+    if value == "model_context_window_exceeded":
+        return "limit_total_tokens"
+    if value == "limit_total_tokens":
+        return "limit_total_tokens"
+    raise BatchResultError(f"unsupported stop reason {value!r}")
+
+
 def parse_batch_result(value: object) -> BatchResult:
     """Validate an untrusted provider/SQLite result and return its typed form."""
 
@@ -89,16 +125,7 @@ def parse_batch_result(value: object) -> BatchResult:
 
 def _parse_message(value: object) -> NormalizedMessage:
     mapping = _mapping(value, "succeeded batch result message")
-    stop_reason = mapping.get("stop_reason")
-    if stop_reason == "end_turn" or stop_reason == "stop_sequence":
-        # Older SQLite rows stored Anthropic's raw stop reason.
-        normalized_stop_reason: StopReason = "end_turn"
-    elif stop_reason == "tool_use":
-        normalized_stop_reason = "tool_use"
-    elif stop_reason == "max_tokens":
-        normalized_stop_reason = "max_tokens"
-    else:
-        raise BatchResultError(f"unsupported normalized stop reason {stop_reason!r}")
+    normalized_stop_reason = normalize_stop_reason(mapping.get("stop_reason"))
 
     raw_content = mapping.get("content")
     if not isinstance(raw_content, list):

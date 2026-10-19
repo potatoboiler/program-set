@@ -6,6 +6,10 @@
 JSON payloads, envelope IDs, batch status, and normalized terminal results in
 SQLite. It validates payload serializability and generic envelope IDs, not
 provider request fields.
+Normalized messages retain supported content and a Strands-compatible stop
+reason; provider message metadata such as IDs, model names, and usage is
+discarded. Anthropic `stop_sequence` remains distinct, while provider-only
+reasons are mapped to the closest supported Strands reason.
 `DeferredBatchModel` shares stable request identity, enqueue/reuse, pending
 interrupts, terminal checks, and result-event replay; it never submits or polls
 by itself.

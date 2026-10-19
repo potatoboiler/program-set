@@ -23,7 +23,7 @@ from program_set.batch_result import (
     BatchResultError,
     BatchResultType,
     NormalizedContentBlock,
-    StopReason,
+    normalize_stop_reason,
     parse_batch_result,
 )
 
@@ -596,19 +596,18 @@ def _normalize_anthropic_result(value: object) -> BatchResult:
         stop_reason = field(message, "stop_reason")
         if not isinstance(content, list):
             raise BatchProtocolError("Anthropic result message content is not a list")
-        if stop_reason == "stop_sequence":
-            stop_reason = "end_turn"
-        normalized_stop_reason: StopReason
-        if stop_reason == "end_turn":
-            normalized_stop_reason = "end_turn"
-        elif stop_reason == "tool_use":
-            normalized_stop_reason = "tool_use"
-        elif stop_reason == "max_tokens":
-            normalized_stop_reason = "max_tokens"
-        else:
-            raise BatchProtocolError(
-                f"unsupported Anthropic stop reason {stop_reason!r}"
-            )
+        try:
+            normalized_stop_reason = normalize_stop_reason(stop_reason)
+        except BatchResultError:
+            # Fail only this request; other results in the same batch remain
+            # eligible for persistence.
+            return {
+                "type": "errored",
+                "error": {
+                    "code": "unsupported_stop_reason",
+                    "message": "Anthropic batch result has an unsupported stop reason",
+                },
+            }
 
         normalized_content: list[NormalizedContentBlock] = []
         for block in content:
