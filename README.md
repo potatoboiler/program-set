@@ -54,10 +54,45 @@ separate JSONL adapter validates its own Responses request shape. There is no
 universal request schema or cross-provider conversion layer. SDK clients are
 injected; constructing adapters makes no network calls.
 
-Callers explicitly flush and poll batches, then re-enter the Agent. Raising
-`InterruptException` directly from `Model.stream` is an undocumented Strands
-provider behavior. The mocked production snapshot/restore/tool-cycle test pins
-this path to Strands 1.61.1; upgrades require revalidation.
+Callers own Strands invocation/advancement and the batch lifecycle: invoke an
+Agent, Graph, or Swarm; persist its Strands snapshot as needed; flush queued
+requests; poll their batches; then pass completed responses back on a later
+invocation. `ready_batch_interrupt_responses(result.interrupts, transport)`
+builds ordinary `interruptResponse` input blocks only for this package's
+durably succeeded requests. It ignores foreign interrupts and ordinary pending
+requests, and surfaces unknown, mismatched, and failed requests. A
+`submit_unknown` request raises `SubmissionUncertainError` with its durable
+submission/request IDs; the caller must establish non-acceptance before
+explicitly requeueing it. The helper never invokes Strands, flushes, polls, or
+retries. Only the deferred model's explicit source marker identifies its
+interrupts; a matching name alone is not enough.
+
+```python
+from program_set.batch_interrupts import ready_batch_interrupt_responses
+
+result = agent("do the work")
+# Persist the Strands snapshot here if the application needs restart recovery.
+batch = transport.flush()  # one caller-owned submission point
+if batch is not None:
+    if transport.poll(batch.batch_id).processing_status == "ended":
+        responses = ready_batch_interrupt_responses(result.interrupts or [], transport)
+        if responses:
+            resumed = agent(responses)  # caller-owned advancement
+# If the batch is not ended, the caller polls again later.
+```
+
+Strands' `SnapshotSessionManager` can persist Agent, Graph, and Swarm runtime
+state. Rebuild the same definitions with stable model `agent_id`s after a
+restart. Nested `Agent.as_tool()` children without their own session manager
+are part of their parent's snapshot; a `preserve_context=True` child keeps its
+own history and therefore needs its own session manager and stable session ID.
+The batch transport persists provider requests/results, not Strands snapshots.
+
+Raising `InterruptException` directly from `Model.stream` is an undocumented
+Strands provider behavior. Mocked production snapshot/restore/tool-cycle tests
+pin this path to Strands 1.61.1; upgrades require revalidation. TODO: determine
+whether to formalize the deferred-inference contract through an upstream
+Strands contribution.
 
 Scope is limited to Anthropic text and function tools, and OpenAI Responses text,
 function tools, and opaque reasoning replay. Images/audio and structured output
