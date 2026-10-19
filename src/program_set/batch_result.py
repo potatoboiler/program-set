@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal, TypedDict
+from typing import Literal, Required, TypedDict
 
 type StopReason = Literal[
     "end_turn",
@@ -33,8 +33,19 @@ class ReasoningContentBlock(TypedDict):
     signature: str
 
 
+class CompactionContentBlock(TypedDict, total=False):
+    type: Required[Literal["compaction"]]
+    content: str | None
+    signature: str | None
+    encrypted_content: str | None
+    tool_changes: list[dict[str, object]] | None
+
+
 type NormalizedContentBlock = (
-    TextContentBlock | ToolUseContentBlock | ReasoningContentBlock
+    TextContentBlock
+    | ToolUseContentBlock
+    | ReasoningContentBlock
+    | CompactionContentBlock
 )
 
 
@@ -170,7 +181,40 @@ def _parse_content_block(value: object) -> NormalizedContentBlock:
         if not isinstance(signature, str):
             raise BatchResultError("normalized reasoning block has no opaque signature")
         return {"type": "reasoning", "signature": signature}
+    if block_type == "compaction":
+        return parse_compaction_block(mapping)
     raise BatchResultError(f"unsupported normalized content block type {block_type!r}")
+
+
+def parse_compaction_block(value: object) -> CompactionContentBlock:
+    """Validate a compaction block while preserving optional provider fields."""
+
+    mapping = _mapping(value, "compaction block")
+    if mapping.get("type") != "compaction":
+        raise BatchResultError("compaction block has an invalid type")
+
+    normalized: CompactionContentBlock = {"type": "compaction"}
+    for name in ("content", "signature", "encrypted_content"):
+        if name not in mapping:
+            continue
+        field_value = mapping[name]
+        if field_value is not None and not isinstance(field_value, str):
+            raise BatchResultError(f"compaction block {name} is not text or null")
+        normalized[name] = field_value
+
+    if "tool_changes" in mapping:
+        raw_changes = mapping["tool_changes"]
+        if raw_changes is not None:
+            if not isinstance(raw_changes, list):
+                raise BatchResultError("compaction block tool_changes is not a list")
+            changes: list[dict[str, object]] = []
+            for raw_change in raw_changes:
+                change = _mapping(raw_change, "compaction tool change")
+                changes.append(dict(change))
+            normalized["tool_changes"] = changes
+        else:
+            normalized["tool_changes"] = None
+    return normalized
 
 
 def _mapping(value: object, description: str) -> Mapping[str, object]:

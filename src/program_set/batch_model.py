@@ -8,6 +8,7 @@ from typing import Any, cast
 from strands.types.content import Messages, SystemContentBlock
 from strands.types.tools import ToolChoice, ToolChoiceToolDict, ToolSpec
 
+from program_set.anthropic_compaction import decode_compaction_signature
 from program_set.batch_transport import BatchTransport
 from program_set.deferred_batch_model import DeferredBatchModel
 
@@ -109,6 +110,27 @@ def _anthropic_message(message: Mapping[str, Any]) -> dict[str, object]:
 def _anthropic_content_block(block: Mapping[str, Any]) -> dict[str, object]:
     if "text" in block:
         return {"type": "text", "text": block["text"]}
+    if "reasoningContent" in block:
+        reasoning = block["reasoningContent"]
+        reasoning_text = (
+            reasoning.get("reasoningText") if isinstance(reasoning, Mapping) else None
+        )
+        signature = (
+            reasoning_text.get("signature")
+            if isinstance(reasoning_text, Mapping)
+            else None
+        )
+        if not isinstance(signature, str):
+            raise ValueError("Anthropic reasoning content has no opaque signature")
+        try:
+            compaction = decode_compaction_signature(signature)
+        except ValueError:
+            raise ValueError("invalid opaque Anthropic compaction signature") from None
+        if compaction is None:
+            raise NotImplementedError(
+                "Anthropic reasoning replay is supported only for compaction blocks"
+            )
+        return dict(compaction)
     if "toolUse" in block:
         tool_use = block["toolUse"]
         return {
@@ -130,4 +152,4 @@ def _anthropic_content_block(block: Mapping[str, Any]) -> dict[str, object]:
         if tool_result.get("status") == "error":
             result["is_error"] = True
         return result
-    raise AssertionError(f"unsupported Strands content block: {block!r}")
+    raise AssertionError("unsupported Strands content block")

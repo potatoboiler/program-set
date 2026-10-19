@@ -15,7 +15,15 @@ interrupts, terminal checks, and result-event replay; it never submits or polls
 by itself.
 
 `BatchBackedModel` maps the tested Strands text/function-tool flow to Anthropic
-Messages. `OpenAIBatchBackedModel` maps the supported text/function-tool subset
+Messages and supports Anthropic threshold compaction. Enable it by configuring
+the transport client as
+`AnthropicBatchClient(client, betas=["compact-2026-01-12"])` and passing
+`context_management={"edits": [{"type": "compact_20260112"}]}` in model config
+or request parameters. Beta mode is explicit, not inferred from queued request
+contents; recreate the client with the same beta configuration after a restart.
+Compaction blocks are carried opaquely through Agent history and restored to
+their original Anthropic content/signature fields. On-demand compaction is not
+supported. `OpenAIBatchBackedModel` maps the supported text/function-tool subset
 to Responses and carries reasoning items opaquely across tool calls. OpenAI's
 separate JSONL adapter validates its own Responses request shape. There is no
 universal request schema or cross-provider conversion layer. SDK clients are

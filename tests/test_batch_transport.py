@@ -21,6 +21,7 @@ from program_set.batch_transport import (
     RequestConflictError,
     SubmissionUncertainError,
     _AnthropicSDKClient,
+    _normalize_anthropic_result,
 )
 from program_set.deferred_batch_model import message_events
 
@@ -588,6 +589,363 @@ class BatchTransportTests(unittest.TestCase):
                     },
                 }
             ],
+        )
+
+    def test_anthropic_beta_adapter_uses_beta_batch_resources(self) -> None:
+        class BetaBatches:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, list[str]]] = []
+
+            def create(
+                self,
+                *,
+                requests: Sequence[BatchRequestEnvelope],
+                betas: list[str],
+            ) -> object:
+                assert len(requests) == 1
+                self.calls.append(("create", betas))
+                return {"id": "beta-batch", "processing_status": "in_progress"}
+
+            def retrieve(self, batch_id: str, *, betas: list[str]) -> object:
+                assert batch_id == "beta-batch"
+                self.calls.append(("retrieve", betas))
+                return {"id": batch_id, "processing_status": "ended"}
+
+            def results(self, batch_id: str, *, betas: list[str]) -> list[object]:
+                assert batch_id == "beta-batch"
+                self.calls.append(("results", betas))
+                return [{"custom_id": "beta-id", "result": {"type": "canceled"}}]
+
+        class BetaMessages:
+            def __init__(self) -> None:
+                self.batches = BetaBatches()
+
+        class Beta:
+            def __init__(self) -> None:
+                self.messages = BetaMessages()
+
+        class SDKClient:
+            def __init__(self) -> None:
+                self.beta = Beta()
+                self.retry_limits: list[int] = []
+
+            @property
+            def messages(self) -> object:
+                raise AssertionError("beta requests must use the beta namespace")
+
+            def with_options(self, *, max_retries: int) -> SDKClient:
+                self.retry_limits.append(max_retries)
+                return self
+
+        sdk_client = SDKClient()
+        adapter = AnthropicBatchClient(
+            cast(_AnthropicSDKClient, sdk_client),
+            betas=["compact-2026-01-12"],
+        )
+        payload: BatchRequestEnvelope = {
+            "custom_id": "beta-id",
+            "params": {
+                **request(),
+                "context_management": {
+                    "edits": [
+                        {
+                            "type": "compact_20260112",
+                            "trigger": {"type": "input_tokens", "value": 50_000},
+                        }
+                    ]
+                },
+            },
+        }
+
+        self.assertEqual(adapter.create_batch([payload]).batch_id, "beta-batch")
+        self.assertEqual(
+            adapter.retrieve_batch("beta-batch").processing_status, "ended"
+        )
+        self.assertEqual(
+            list(
+                adapter.iter_batch_results(
+                    "beta-batch", expected_custom_ids=("beta-id",)
+                )
+            ),
+            [{"custom_id": "beta-id", "result": {"type": "canceled"}}],
+        )
+        self.assertEqual(sdk_client.retry_limits, [0])
+        self.assertEqual(
+            sdk_client.beta.messages.batches.calls,
+            [
+                ("create", ["compact-2026-01-12"]),
+                ("retrieve", ["compact-2026-01-12"]),
+                ("results", ["compact-2026-01-12"]),
+            ],
+        )
+
+    def test_anthropic_threshold_context_management_validation(self) -> None:
+        adapter = AnthropicBatchClient(
+            cast(_AnthropicSDKClient, object()), betas=["compact-2026-01-12"]
+        )
+
+        def validate(context_management: object) -> None:
+            adapter.validate_requests(
+                [
+                    {
+                        "custom_id": "context-test",
+                        "params": {
+                            **request(),
+                            "context_management": context_management,
+                        },
+                    }
+                ]
+            )
+
+        validate({"edits": [{"type": "compact_20260112"}]})
+        validate(
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {"type": "input_tokens", "value": 50_000},
+                    }
+                ]
+            }
+        )
+
+        invalid_contexts = (
+            {"edits": [{"type": "summarize"}]},
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {"type": "input_tokens"},
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {"type": "tokens", "value": 50_000},
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {"type": "input_tokens", "value": 49_999},
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {"type": "input_tokens", "value": 50_000.0},
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {"type": "input_tokens", "value": True},
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "trigger": {
+                            "type": "input_tokens",
+                            "value": 50_000,
+                            "extra": 1,
+                        },
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "instructions": "not supported",
+                    }
+                ]
+            },
+            {
+                "edits": [
+                    {
+                        "type": "compact_20260112",
+                        "pause_after_compaction": True,
+                    }
+                ]
+            },
+            {"edits": [{"type": "compact_20260112"}], "unknown": True},
+            {"edits": []},
+            {"edits": "not a list"},
+            {"edits": [{"type": "compact_20260112"}, "not an edit object"]},
+        )
+        for context_management in invalid_contexts:
+            with (
+                self.subTest(context_management=context_management),
+                self.assertRaises((TypeError, ValueError)),
+            ):
+                validate(context_management)
+
+        non_beta_adapter = AnthropicBatchClient(cast(_AnthropicSDKClient, object()))
+        with self.assertRaisesRegex(ValueError, "requires.*compact-2026-01-12"):
+            non_beta_adapter.validate_requests(
+                [
+                    {
+                        "custom_id": "context-test",
+                        "params": {
+                            **request(),
+                            "context_management": {
+                                "edits": [{"type": "compact_20260112"}]
+                            },
+                        },
+                    }
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "on-demand"):
+            adapter.validate_requests(
+                [
+                    {
+                        "custom_id": "on-demand-test",
+                        "params": {**request(), "compaction": {"type": "summarize"}},
+                    }
+                ]
+            )
+
+    def test_anthropic_compaction_result_blocks_preserve_order_and_multiplicity(
+        self,
+    ) -> None:
+        raw_result = {
+            "type": "succeeded",
+            "message": {
+                "content": [
+                    {"type": "text", "text": "before"},
+                    {
+                        "type": "compaction",
+                        "content": "private summary one",
+                        "signature": "opaque-signature-one",
+                        "encrypted_content": "opaque-encrypted-one",
+                        "tool_changes": [
+                            {
+                                "type": "tool_addition",
+                                "tool": {"type": "tool_reference", "name": "lookup"},
+                            }
+                        ],
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_one",
+                        "name": "lookup",
+                        "input": {"query": "sample"},
+                    },
+                    {
+                        "type": "compaction",
+                        "content": "private summary two",
+                        "signature": "opaque-signature-two",
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+        }
+
+        normalized = _normalize_anthropic_result(raw_result)
+        parsed = parse_batch_result(normalized)
+
+        expected_blocks = [
+            {"type": "text", "text": "before"},
+            {
+                "type": "compaction",
+                "content": "private summary one",
+                "signature": "opaque-signature-one",
+                "encrypted_content": "opaque-encrypted-one",
+                "tool_changes": [
+                    {
+                        "type": "tool_addition",
+                        "tool": {"type": "tool_reference", "name": "lookup"},
+                    }
+                ],
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_one",
+                "name": "lookup",
+                "input": {"query": "sample"},
+            },
+            {
+                "type": "compaction",
+                "content": "private summary two",
+                "signature": "opaque-signature-two",
+            },
+        ]
+        self.assertEqual(normalized["type"], "succeeded")
+        self.assertEqual(parsed["type"], "succeeded")
+        self.assertEqual(
+            successful_result(parsed)["message"]["content"], expected_blocks
+        )
+
+    def test_anthropic_failed_compaction_block_round_trips_as_noop(self) -> None:
+        failed_block = {
+            "type": "compaction",
+            "content": None,
+            "signature": None,
+            "encrypted_content": "opaque-encrypted",
+            "tool_changes": [],
+        }
+        self.assertEqual(
+            _normalize_anthropic_result(
+                {
+                    "type": "succeeded",
+                    "message": {
+                        "content": [failed_block],
+                        "stop_reason": "end_turn",
+                    },
+                }
+            ),
+            {
+                "type": "succeeded",
+                "message": {
+                    "content": [failed_block],
+                    "stop_reason": "end_turn",
+                },
+            },
+        )
+
+    def test_anthropic_compaction_blocks_reject_invalid_optional_field_types(
+        self,
+    ) -> None:
+        for block in (
+            {"type": "compaction", "content": 42, "signature": "opaque"},
+            {"type": "compaction", "content": "summary", "signature": 42},
+            {"type": "compaction", "encrypted_content": 42},
+            {"type": "compaction", "tool_changes": "not-a-list"},
+        ):
+            with self.subTest(block_type=block), self.assertRaises(BatchProtocolError):
+                _normalize_anthropic_result(
+                    {
+                        "type": "succeeded",
+                        "message": {"content": [block], "stop_reason": "end_turn"},
+                    }
+                )
+
+    def test_anthropic_on_demand_compaction_stop_reason_is_unsupported(self) -> None:
+        self.assertEqual(
+            _normalize_anthropic_result(
+                {
+                    "type": "succeeded",
+                    "message": {"content": [], "stop_reason": "compaction"},
+                }
+            ),
+            {
+                "type": "errored",
+                "error": {
+                    "code": "unsupported_stop_reason",
+                    "message": "Anthropic batch result has an unsupported stop reason",
+                },
+            },
         )
 
 

@@ -20,6 +20,7 @@ from strands.types.content import ContentBlockStart, Messages, SystemContentBloc
 from strands.types.streaming import ContentBlockDelta, StreamEvent
 from strands.types.tools import ToolChoice, ToolSpec
 
+from program_set.anthropic_compaction import encode_compaction_signature
 from program_set.batch_json import canonical_json
 from program_set.batch_result import NormalizedMessage
 from program_set.batch_transport import BatchTransport, UnknownRequestError
@@ -145,7 +146,7 @@ class DeferredBatchModel(Model):
 
 
 def message_events(message: NormalizedMessage) -> list[StreamEvent]:
-    """Replay normalized text, reasoning, and function-tool response blocks."""
+    """Replay normalized text, opaque blocks, and function-tool response blocks."""
 
     events: list[StreamEvent] = [{"messageStart": {"role": "assistant"}}]
     for block in message["content"]:
@@ -154,6 +155,11 @@ def message_events(message: NormalizedMessage) -> list[StreamEvent]:
             start: ContentBlockStart = {}
         elif block["type"] == "reasoning":
             delta = {"reasoningContent": {"signature": block["signature"]}}
+            start = {}
+        elif block["type"] == "compaction":
+            delta = {
+                "reasoningContent": {"signature": encode_compaction_signature(block)}
+            }
             start = {}
         elif block["type"] == "tool_use":
             delta = {"toolUse": {"input": canonical_json(block["input"])}}

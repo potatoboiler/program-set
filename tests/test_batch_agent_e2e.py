@@ -13,6 +13,7 @@ import json
 from collections.abc import Sequence
 from importlib.metadata import version
 from pathlib import Path
+from typing import Any
 
 import pytest
 from batch_test_types import (
@@ -25,9 +26,15 @@ from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
 
+from program_set.anthropic_compaction import encode_compaction_signature
 from program_set.batch_model import BatchBackedModel
-from program_set.batch_result import BatchResultEnvelope, NormalizedMessage
+from program_set.batch_result import (
+    BatchResultEnvelope,
+    CompactionContentBlock,
+    NormalizedMessage,
+)
 from program_set.batch_transport import (
+    AnthropicBatchClient,
     BatchInfo,
     BatchRequestEnvelope,
     BatchTransport,
@@ -62,6 +69,77 @@ class FakeAnthropicBatchClient:
 
     def complete(self, batch_id: str, results: list[object]) -> None:
         self._batches[batch_id] = ("ended", results)
+
+
+class FakeNonBetaBatches:
+    """Minimal non-beta resource retained so the fake satisfies the SDK protocol."""
+
+    def create(self, *, requests: Sequence[Any]) -> object:
+        return {}
+
+    def retrieve(self, batch_id: str) -> object:
+        return {}
+
+    def results(self, batch_id: str) -> list[object]:
+        return []
+
+
+class FakeNonBetaMessages:
+    def __init__(self) -> None:
+        self.batches = FakeNonBetaBatches()
+
+
+class FakeBetaBatches:
+    """SDK-shaped beta batch resources; all operations stay offline."""
+
+    def __init__(self) -> None:
+        self.submissions: list[list[BatchRequestEnvelope]] = []
+        self._batches: dict[str, tuple[str, list[object]]] = {}
+        self.beta_calls: list[tuple[str, list[str]]] = []
+
+    def create(
+        self,
+        *,
+        requests: Sequence[BatchRequestEnvelope],
+        betas: list[str],
+    ) -> object:
+        batch_id = f"msgbatch_beta_{len(self.submissions) + 1}"
+        self.beta_calls.append(("create", betas))
+        self.submissions.append(list(requests))
+        self._batches[batch_id] = ("in_progress", [])
+        return {"id": batch_id, "processing_status": "in_progress"}
+
+    def retrieve(self, batch_id: str, *, betas: list[str]) -> object:
+        self.beta_calls.append(("retrieve", betas))
+        status, _ = self._batches[batch_id]
+        return {"id": batch_id, "processing_status": status}
+
+    def results(self, batch_id: str, *, betas: list[str]) -> list[object]:
+        self.beta_calls.append(("results", betas))
+        return self._batches[batch_id][1]
+
+    def complete(self, batch_id: str, results: list[object]) -> None:
+        self._batches[batch_id] = ("ended", results)
+
+
+class FakeBetaMessages:
+    def __init__(self) -> None:
+        self.batches = FakeBetaBatches()
+
+
+class FakeBetaNamespace:
+    def __init__(self) -> None:
+        self.messages = FakeBetaMessages()
+
+
+class FakeAnthropicSDKClient:
+    def __init__(self) -> None:
+        self.beta = FakeBetaNamespace()
+        self.messages = FakeNonBetaMessages()
+
+    def with_options(self, *, max_retries: int) -> FakeAnthropicSDKClient:
+        assert max_retries == 0
+        return self
 
 
 def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
@@ -265,6 +343,236 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         transport.close()
 
 
+def test_threshold_compaction_round_trips_through_restored_tool_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = tmp_path / "compaction-batches.sqlite"
+    sdk_client = FakeAnthropicSDKClient()
+    beta_batches = sdk_client.beta.messages.batches
+    beta = "compact-2026-01-12"
+    compacted_content = "private-compaction-summary-canary"
+    compacted_signature = "private-compaction-signature-canary"
+    compaction_block: CompactionContentBlock = {
+        "type": "compaction",
+        "content": compacted_content,
+        "signature": compacted_signature,
+        "encrypted_content": "private-compaction-encrypted-canary",
+        "tool_changes": [
+            {
+                "type": "tool_addition",
+                "tool": {"type": "tool_reference", "name": "lookup"},
+            }
+        ],
+    }
+    context_management = {
+        "edits": [
+            {
+                "type": "compact_20260112",
+                "trigger": {"type": "input_tokens", "value": 50_000},
+            }
+        ]
+    }
+    tool_calls: list[str] = []
+
+    @tool
+    def lookup(query: str) -> str:
+        """Look up a deterministic sample value."""
+        tool_calls.append(query)
+        return f"{query}-result"
+
+    transport = BatchTransport(AnthropicBatchClient(sdk_client, betas=[beta]), database)
+    try:
+        initial_model = BatchBackedModel(
+            transport, agent_id="compaction-agent", model_id="claude-test"
+        )
+        initial_model.update_config(context_management=context_management)
+        initial_agent = Agent(model=initial_model, tools=[lookup])
+        deferred = initial_agent("look up sample")
+        assert deferred.stop_reason == "interrupt"
+        assert deferred.interrupts is not None and len(deferred.interrupts) == 1
+        first_interrupt = deferred.interrupts[0]
+        first_request_id = initial_model.queued_request_ids[0]
+        first_record = transport.get_request(first_request_id)
+        first_snapshot = _round_trip_snapshot(
+            initial_agent.take_snapshot(
+                preset="session",
+                app_data={
+                    "agent_id": "compaction-agent",
+                    "request_id": first_request_id,
+                },
+            )
+        )
+
+        first_batch = transport.flush()
+        assert first_batch is not None
+        first_params = beta_batches.submissions[0][0]["params"]
+        assert first_params["context_management"] == context_management
+
+        beta_batches.complete(
+            first_batch.batch_id,
+            [
+                {
+                    "custom_id": first_record.custom_id,
+                    "result": {
+                        "type": "succeeded",
+                        "message": {
+                            "content": [
+                                compaction_block,
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_compaction_lookup",
+                                    "name": "lookup",
+                                    "input": {"query": "sample"},
+                                },
+                            ],
+                            "stop_reason": "tool_use",
+                        },
+                    },
+                }
+            ],
+        )
+        assert transport.poll(first_batch.batch_id).processing_status == "ended"
+        assert transport.get_request(first_request_id).result == {
+            "type": "succeeded",
+            "message": {
+                "content": [
+                    compaction_block,
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_compaction_lookup",
+                        "name": "lookup",
+                        "input": {"query": "sample"},
+                    },
+                ],
+                "stop_reason": "tool_use",
+            },
+        }
+        transport.close()
+
+        # A process restart must recreate the client with the explicit beta.
+        transport = BatchTransport(
+            AnthropicBatchClient(sdk_client, betas=[beta]), database
+        )
+        resumed_model = BatchBackedModel(
+            transport, agent_id="compaction-agent", model_id="claude-test"
+        )
+        resumed_model.update_config(context_management=context_management)
+        resumed_agent = Agent(model=resumed_model, tools=[lookup])
+        resumed_agent.load_snapshot(first_snapshot)
+        after_tool = resumed_agent(
+            [
+                {
+                    "interruptResponse": {
+                        "interruptId": first_interrupt.id,
+                        "response": {"request_id": first_request_id, "ready": True},
+                    }
+                }
+            ]
+        )
+        assert after_tool.stop_reason == "interrupt"
+        assert after_tool.interrupts is not None and len(after_tool.interrupts) == 1
+        assert tool_calls == ["sample"]
+
+        second_request_id = resumed_model.queued_request_ids[0]
+        second_record = transport.get_request(second_request_id)
+        second_snapshot = _round_trip_snapshot(
+            resumed_agent.take_snapshot(
+                preset="session",
+                app_data={
+                    "agent_id": "compaction-agent",
+                    "request_id": second_request_id,
+                },
+            )
+        )
+        second_batch = transport.flush()
+        assert second_batch is not None
+        second_params = beta_batches.submissions[1][0]["params"]
+        assert second_params["context_management"] == context_management
+        anthropic_messages = _dict_list(second_params["messages"])
+        assistant_blocks = [
+            block
+            for message in anthropic_messages
+            if message["role"] == "assistant"
+            for block in _dict_list(message["content"])
+        ]
+        assert assistant_blocks == [
+            compaction_block,
+            {
+                "type": "tool_use",
+                "id": "toolu_compaction_lookup",
+                "name": "lookup",
+                "input": {"query": "sample"},
+            },
+        ]
+        tool_result_blocks = [
+            block
+            for message in anthropic_messages
+            if message["role"] == "user"
+            for block in _dict_list(message["content"])
+            if block.get("type") == "tool_result"
+        ]
+        assert tool_result_blocks == [
+            {
+                "type": "tool_result",
+                "tool_use_id": "toolu_compaction_lookup",
+                "content": [{"type": "text", "text": "sample-result"}],
+            }
+        ]
+        assert transport.get_request(second_request_id).status == "submitted"
+
+        beta_batches.complete(
+            second_batch.batch_id,
+            [
+                {
+                    "custom_id": second_record.custom_id,
+                    "result": {
+                        "type": "succeeded",
+                        "message": {
+                            "content": [{"type": "text", "text": "Done."}],
+                            "stop_reason": "end_turn",
+                        },
+                    },
+                }
+            ],
+        )
+        transport.poll(second_batch.batch_id)
+        transport.close()
+
+        transport = BatchTransport(
+            AnthropicBatchClient(sdk_client, betas=[beta]), database
+        )
+        final_model = BatchBackedModel(
+            transport, agent_id="compaction-agent", model_id="claude-test"
+        )
+        final_model.update_config(context_management=context_management)
+        final_agent = Agent(model=final_model, tools=[lookup])
+        final_agent.load_snapshot(second_snapshot)
+        completed = final_agent(
+            [
+                {
+                    "interruptResponse": {
+                        "interruptId": after_tool.interrupts[0].id,
+                        "response": {"request_id": second_request_id, "ready": True},
+                    }
+                }
+            ]
+        )
+        assert completed.stop_reason == "end_turn"
+        assert tool_calls == ["sample"]
+        assert beta_batches.beta_calls
+        assert all(call_betas == [beta] for _, call_betas in beta_batches.beta_calls)
+
+        captured = capsys.readouterr()
+        captured_output = captured.out + captured.err + caplog.text
+        assert compacted_content not in captured_output
+        assert compacted_signature not in captured_output
+        assert encode_compaction_signature(compaction_block) not in captured_output
+    finally:
+        transport.close()
+
+
 def test_identical_requests_from_distinct_agents_get_distinct_ids(
     tmp_path: Path,
 ) -> None:
@@ -322,6 +630,34 @@ def test_anthropic_request_drops_strands_runtime_kwargs(tmp_path: Path) -> None:
         assert params["max_tokens"] == 32
         assert "model_state" not in params
         assert "dynamic_trailing_blocks" not in params
+    finally:
+        transport.close()
+
+
+def test_anthropic_context_management_request_kwarg_is_preserved(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "context-management-kwargs.sqlite")
+    model = BatchBackedModel(
+        transport, agent_id="context-management-kwargs", model_id="claude-test"
+    )
+    context_management = {"edits": [{"type": "compact_20260112"}]}
+
+    async def defer() -> None:
+        with pytest.raises(InterruptException):
+            await anext(
+                model.stream(
+                    strands_messages([{"role": "user", "content": "hello"}]),
+                    context_management=context_management,
+                )
+            )
+
+    try:
+        asyncio.run(defer())
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        params = client.submissions[0][0]["params"]
+        assert params["context_management"] == context_management
     finally:
         transport.close()
 
