@@ -21,6 +21,7 @@ from strands.types.content import Messages, SystemContentBlock
 from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolChoice, ToolSpec
 
+from program_set.batch_result import NormalizedMessage
 from program_set.batch_transport import BatchTransport, UnknownRequestError
 
 
@@ -126,8 +127,8 @@ class DeferredBatchModel(Model):
             )
 
         assert record.result is not None
+        assert record.result["type"] == "succeeded"
         message = record.result["message"]
-        assert isinstance(message, Mapping)
         for event in message_events(message):
             yield event
 
@@ -143,7 +144,7 @@ class DeferredBatchModel(Model):
         raise NotImplementedError
 
 
-def message_events(message: Mapping[str, Any]) -> list[StreamEvent]:
+def message_events(message: NormalizedMessage) -> list[StreamEvent]:
     """Replay normalized text, reasoning, and function-tool response blocks."""
 
     events: list[StreamEvent] = [{"messageStart": {"role": "assistant"}}]

@@ -4,11 +4,12 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
 
 import anthropic
 import httpx2
 
+from batch_test_types import succeeded, successful_result
+from program_set.batch_result import BatchResultError, parse_batch_result
 from program_set.batch_transport import (
     AnthropicBatchClient,
     BatchInfo,
@@ -110,13 +111,12 @@ class BatchTransportTests(unittest.TestCase):
             },
             {
                 "custom_id": "custom-1",
-                "result": {
-                    "type": "succeeded",
-                    "message": {
-                        "id": "msg_1",
+                "result": succeeded(
+                    {
                         "content": [{"type": "text", "text": "ok"}],
-                    },
-                },
+                        "stop_reason": "end_turn",
+                    }
+                ),
             },
         ]
         self.assertEqual(
@@ -127,9 +127,8 @@ class BatchTransportTests(unittest.TestCase):
         second_record = self.transport.get_request(second.request_id)
         self.assertEqual(first_record.status, "succeeded")
         self.assertEqual(first_record.result_status, "succeeded")
-        assert first_record.result is not None
-        message = cast(dict[str, Any], first_record.result["message"])
-        self.assertEqual(message["id"], "msg_1")
+        message = successful_result(first_record.result)["message"]
+        self.assertEqual(message["content"], [{"type": "text", "text": "ok"}])
         self.assertEqual(first_record.metadata, {"job": "alpha"})
         self.assertEqual(second_record.status, "errored")
         self.assertEqual(second_record.result_status, "errored")
@@ -216,7 +215,7 @@ class BatchTransportTests(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             self.transport.enqueue(
-                cast(Any, ["not a mapping"]),
+                ["not a mapping"],
                 request_id="not-mapping",
             )
         with self.assertRaises(TypeError):
@@ -299,6 +298,39 @@ class BatchTransportTests(unittest.TestCase):
         with self.assertRaises(BatchProtocolError):
             self.transport.poll("msgbatch_test")
 
+    def test_normalized_result_parser_validates_and_discards_provider_extras(self) -> None:
+        result = parse_batch_result(
+            {
+                "type": "succeeded",
+                "message": {
+                    "id": "provider-message-id",
+                    "usage": {"input_tokens": 3},
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                },
+            }
+        )
+        self.assertEqual(
+            result,
+            {
+                "type": "succeeded",
+                "message": {
+                    "content": [{"type": "text", "text": "ok"}],
+                    "stop_reason": "end_turn",
+                },
+            },
+        )
+        with self.assertRaises(BatchResultError):
+            parse_batch_result(
+                {
+                    "type": "succeeded",
+                    "message": {
+                        "content": [{"type": "text", "text": 42}],
+                        "stop_reason": "end_turn",
+                    },
+                }
+            )
+
     def test_restart_marks_interrupted_submissions_uncertain(self) -> None:
         enqueued = self.transport.enqueue(request(), request_id="interrupted")
         with self.transport._connection:
@@ -332,7 +364,20 @@ class BatchTransportTests(unittest.TestCase):
                 return {"id": batch_id, "processing_status": "ended"}
 
             def results(self, batch_id: str) -> list[object]:
-                return [{"custom_id": "id", "result": {"type": "canceled"}}]
+                return [
+                    {
+                        "custom_id": "id",
+                        "result": {
+                            "type": "succeeded",
+                            "message": {
+                                "id": "provider-id",
+                                "content": [{"type": "text", "text": "ready"}],
+                                "stop_reason": "end_turn",
+                                "usage": {"input_tokens": 3},
+                            },
+                        },
+                    }
+                ]
 
         class Messages:
             def __init__(self) -> None:
@@ -353,12 +398,19 @@ class BatchTransportTests(unittest.TestCase):
         self.assertEqual(sdk_client.messages.batches.sent, [payload])
         self.assertEqual(adapter.retrieve_batch("remote-id").processing_status, "ended")
         self.assertEqual(
-            len(
-                list(
-                    adapter.iter_batch_results("remote-id", expected_custom_ids=("id",))
-                )
-            ),
-            1,
+            list(adapter.iter_batch_results("remote-id", expected_custom_ids=("id",))),
+            [
+                {
+                    "custom_id": "id",
+                    "result": {
+                        "type": "succeeded",
+                        "message": {
+                            "content": [{"type": "text", "text": "ready"}],
+                            "stop_reason": "end_turn",
+                        },
+                    },
+                }
+            ],
         )
 
 

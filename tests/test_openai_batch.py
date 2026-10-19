@@ -7,14 +7,15 @@ import json
 from collections.abc import Sequence
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
-from strands.types.content import Messages
 
+from batch_test_types import strands_messages, successful_result
+from program_set.batch_result import SucceededBatchResult
 from program_set.batch_transport import BatchInfo, BatchProtocolError, BatchTransport
 from program_set.openai_batch_transport import OpenAIBatchClient
 from program_set.openai_responses_batch_model import OpenAIBatchBackedModel
@@ -581,8 +582,7 @@ def test_reasoning_item_round_trips_opaquely_before_function_call(
         tmp_path, [reasoning_item, _function_call_item()]
     )
 
-    first_message = cast(dict[str, object], first_result["message"])
-    first_blocks = cast(list[dict[str, object]], first_message["content"])
+    first_blocks = first_result["message"]["content"]
     assert [block["type"] for block in first_blocks] == [
         "reasoning",
         "tool_use",
@@ -613,8 +613,7 @@ def test_tool_cycle_without_reasoning_item_has_no_reasoning_input(
         tmp_path, [_function_call_item()]
     )
 
-    first_message = cast(dict[str, object], first_result["message"])
-    first_blocks = cast(list[dict[str, object]], first_message["content"])
+    first_blocks = first_result["message"]["content"]
     assert [block["type"] for block in first_blocks] == ["tool_use"]
     assert all(item.get("type") != "reasoning" for item in second_input)
     assert [item.get("type") for item in second_input if "type" in item] == [
@@ -711,7 +710,7 @@ def test_runtime_state_does_not_change_openai_request_identity(
         with pytest.raises(InterruptException):
             await anext(
                 model.stream(
-                    cast(Messages, [{"role": "user", "content": "hello"}]),
+                    strands_messages([{"role": "user", "content": "hello"}]),
                     model_state=model_state,
                     dynamic_trailing_blocks=dynamic_trailing_blocks,
                 )
@@ -739,7 +738,7 @@ def test_unsupported_responses_fields_are_rejected_before_upload(
     }
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         _responses_params(
-            cast(Messages, [{"role": "user", "content": "hello"}]),
+            strands_messages([{"role": "user", "content": "hello"}]),
             None,
             None,
             None,
@@ -786,10 +785,9 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
 
         with pytest.raises(NotImplementedError, match="structured output"):
             _responses_params(
-                cast(
-                    Messages,
-                    [{"role": "user", "content": [{"image": "not-supported"}]}],
-                ),
+                    strands_messages(
+                        [{"role": "user", "content": [{"image": "not-supported"}]}]
+                    ),
                 None,
                 None,
                 None,
@@ -799,10 +797,9 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
             )
         with pytest.raises(NotImplementedError, match="unsupported user content"):
             _responses_params(
-                cast(
-                    Messages,
-                    [{"role": "user", "content": [{"image": "not-supported"}]}],
-                ),
+                    strands_messages(
+                        [{"role": "user", "content": [{"image": "not-supported"}]}]
+                    ),
                 None,
                 None,
                 None,
@@ -816,7 +813,7 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
 
 def _run_tool_cycle_to_second_request(
     tmp_path: Path, first_output: Sequence[dict[str, object]]
-) -> tuple[dict[str, object], list[dict[str, object]], list[str]]:
+) -> tuple[SucceededBatchResult, list[dict[str, object]], list[str]]:
     """Run one batch-backed tool turn and return the queued follow-up input."""
 
     sdk_client = FakeOpenAIClient()
@@ -874,8 +871,7 @@ def _run_tool_cycle_to_second_request(
         assert transport.poll(first_batch.batch_id) == BatchInfo(
             first_batch.batch_id, "ended"
         )
-        first_result = transport.get_request(first_request_id)
-        assert first_result.result is not None
+        first_result = successful_result(transport.get_request(first_request_id).result)
 
         restored_model = OpenAIBatchBackedModel(
             transport, agent_id=agent_id, model_id="gpt-4o-mini-test"
@@ -903,7 +899,7 @@ def _run_tool_cycle_to_second_request(
         second_batch = transport.flush()
         assert second_batch is not None
         second_line = json.loads(sdk_client.files.uploads[1]["content"].splitlines()[0])
-        return dict(first_result.result), second_line["body"]["input"], tool_calls
+        return first_result, second_line["body"]["input"], tool_calls
     finally:
         transport.close()
 

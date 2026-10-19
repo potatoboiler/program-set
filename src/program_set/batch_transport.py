@@ -17,6 +17,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, Protocol, Self, TypedDict, cast
 
+from program_set.batch_result import (
+    BatchResult,
+    BatchResultError,
+    BatchResultType,
+    StopReason,
+    parse_batch_result,
+)
+
 RequestStatus = Literal[
     "queued",
     "submitting",
@@ -55,8 +63,8 @@ class RequestRecord:
     metadata: Mapping[str, str]
     status: RequestStatus
     batch_id: str | None
-    result_status: str | None
-    result: Mapping[str, object] | None
+    result_status: BatchResultType | None
+    result: BatchResult | None
     submission_id: str | None
 
 
@@ -137,7 +145,14 @@ class AnthropicBatchClient:
         self, batch_id: str, *, expected_custom_ids: Sequence[str]
     ) -> Iterable[object]:
         del expected_custom_ids
-        return self._batch_resource().results(batch_id)
+        for response in self._batch_resource().results(batch_id):
+            custom_id = _field(response, "custom_id")
+            if not isinstance(custom_id, str) or not custom_id:
+                raise BatchProtocolError("Anthropic batch result has no valid custom_id")
+            yield {
+                "custom_id": custom_id,
+                "result": _normalize_anthropic_result(_field(response, "result")),
+            }
 
     def _batch_resource(self) -> _AnthropicBatchesResource:
         return self._client.messages.batches
@@ -201,7 +216,7 @@ class BatchTransport:
 
     def enqueue(
         self,
-        params: Mapping[str, object],
+        params: object,
         *,
         request_id: str | None = None,
         custom_id: str | None = None,
@@ -381,19 +396,16 @@ class BatchTransport:
                 raise BatchProtocolError(
                     f"duplicate result for custom_id {custom_id!r}"
                 )
-            result_status = _field(result, "type")
-            if not isinstance(result_status, str) or result_status not in {
-                "succeeded",
-                "errored",
-                "canceled",
-                "expired",
-            }:
+            try:
+                normalized_result = parse_batch_result(_jsonable(result))
+            except BatchResultError as exc:
                 raise BatchProtocolError(
-                    f"unsupported result type {result_status!r} for {custom_id!r}"
-                )
+                    f"invalid result for {custom_id!r}: {exc}"
+                ) from exc
+            result_status = normalized_result["type"]
             results_by_custom_id[custom_id] = (
                 result_status,
-                _dump_json(_jsonable(result)),
+                _dump_json(normalized_result),
             )
 
         with self._connection:
@@ -428,17 +440,23 @@ class BatchTransport:
             ).fetchone()
         if row is None:
             raise UnknownRequestError(f"request_id {request_id!r} is not registered")
-        result = (
+        raw_result = (
             json.loads(row["result_json"]) if row["result_json"] is not None else None
         )
+        try:
+            result = parse_batch_result(raw_result) if raw_result is not None else None
+        except BatchResultError as exc:
+            raise BatchProtocolError(
+                f"stored result for {request_id!r} is malformed: {exc}"
+            ) from exc
         return RequestRecord(
             request_id=str(row["request_id"]),
             custom_id=str(row["custom_id"]),
             metadata=cast(dict[str, str], json.loads(row["metadata_json"])),
             status=cast(RequestStatus, row["status"]),
             batch_id=row["batch_id"],
-            result_status=row["result_status"],
-            result=cast(Mapping[str, object] | None, result),
+            result_status=cast(BatchResultType | None, row["result_status"]),
+            result=result,
             submission_id=row["submission_id"],
         )
 
@@ -526,8 +544,15 @@ class BatchTransport:
 def _validated_params(params: object) -> dict[str, object]:
     if not isinstance(params, Mapping):
         raise TypeError("params must be a mapping")
-    mapping = cast(Mapping[object, object], params)
-    return cast(dict[str, object], json.loads(_dump_json(dict(mapping))))
+    decoded = json.loads(_dump_json(dict(params)))
+    if not isinstance(decoded, dict):
+        raise TypeError("params must serialize as an object")
+    result: dict[str, object] = {}
+    for key, value in decoded.items():
+        if not isinstance(key, str):
+            raise TypeError("params keys must be strings")
+        result[key] = value
+    return result
 
 
 def _validate_anthropic_request(request: BatchRequestEnvelope) -> None:
@@ -569,6 +594,88 @@ def _batch_info(value: object) -> BatchInfo:
     if not isinstance(batch_id, str) or not isinstance(processing_status, str):
         raise BatchProtocolError("Anthropic batch response is missing id/status")
     return BatchInfo(batch_id, processing_status)
+
+
+def _normalize_anthropic_result(value: object) -> BatchResult:
+    result_type = _field(value, "type")
+    if result_type == "succeeded":
+        message = _field(value, "message")
+        content = _field(message, "content")
+        stop_reason = _field(message, "stop_reason")
+        if not isinstance(content, list):
+            raise BatchProtocolError("Anthropic result message content is not a list")
+        if stop_reason == "stop_sequence":
+            stop_reason = "end_turn"
+        normalized_stop_reason: StopReason
+        if stop_reason == "end_turn":
+            normalized_stop_reason = "end_turn"
+        elif stop_reason == "tool_use":
+            normalized_stop_reason = "tool_use"
+        elif stop_reason == "max_tokens":
+            normalized_stop_reason = "max_tokens"
+        else:
+            raise BatchProtocolError(
+                f"unsupported Anthropic stop reason {stop_reason!r}"
+            )
+
+        normalized_content: list[dict[str, object]] = []
+        for block in content:
+            block_type = _field(block, "type")
+            if block_type == "text":
+                text = _field(block, "text")
+                if not isinstance(text, str):
+                    raise BatchProtocolError("Anthropic text block is not text")
+                normalized_content.append({"type": "text", "text": text})
+            elif block_type == "tool_use":
+                tool_id = _field(block, "id")
+                name = _field(block, "name")
+                tool_input = _field(block, "input")
+                if (
+                    not isinstance(tool_id, str)
+                    or not isinstance(name, str)
+                    or not isinstance(tool_input, Mapping)
+                ):
+                    raise BatchProtocolError("Anthropic tool_use block is malformed")
+                normalized_input: dict[str, object] = {}
+                for key, item in tool_input.items():
+                    if not isinstance(key, str):
+                        raise BatchProtocolError(
+                            "Anthropic tool_use input is not a string-keyed object"
+                        )
+                    normalized_input[key] = item
+                normalized_content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": name,
+                        "input": normalized_input,
+                    }
+                )
+            elif block_type == "reasoning":
+                signature = _field(block, "signature")
+                if not isinstance(signature, str):
+                    raise BatchProtocolError("Anthropic reasoning block is malformed")
+                normalized_content.append(
+                    {"type": "reasoning", "signature": signature}
+                )
+            else:
+                raise BatchProtocolError(
+                    f"unsupported Anthropic result content block {block_type!r}"
+                )
+        return {
+            "type": "succeeded",
+            "message": {
+                "content": normalized_content,
+                "stop_reason": normalized_stop_reason,
+            },
+        }
+    if result_type == "errored":
+        return {"type": "errored", "error": _jsonable(_field(value, "error"))}
+    if result_type == "canceled":
+        return {"type": "canceled"}
+    if result_type == "expired":
+        return {"type": "expired"}
+    raise BatchProtocolError(f"unsupported Anthropic result type {result_type!r}")
 
 
 def _validate_batch_info(batch: BatchInfo) -> None:

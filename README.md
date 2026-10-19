@@ -3,8 +3,9 @@
 ## Batch-backed Strands models
 
 `program_set.batch_transport.BatchTransport` persists opaque provider-specific
-JSON payloads, envelope IDs, batch status, and results in SQLite. It validates
-payload serializability and generic envelope IDs, not provider fields.
+JSON payloads, envelope IDs, batch status, and normalized terminal results in
+SQLite. It validates payload serializability and generic envelope IDs, not
+provider request fields.
 `DeferredBatchModel` shares stable request identity, enqueue/reuse, pending
 interrupts, terminal checks, and result-event replay; it never submits or polls
 by itself.

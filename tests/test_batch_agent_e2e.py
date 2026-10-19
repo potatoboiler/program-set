@@ -13,14 +13,17 @@ import json
 from collections.abc import Sequence
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
-from strands.types.content import Messages
 
+from batch_test_types import (
+    strands_messages,
+    succeeded as make_succeeded,
+)
+from program_set.batch_result import BatchResultEnvelope, NormalizedMessage
 from program_set.batch_model import BatchBackedModel
 from program_set.batch_transport import (
     BatchInfo,
@@ -113,11 +116,11 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         first_payload = client.submissions[0]
         assert len(first_payload) == 1
         assert first_payload[0]["custom_id"] == first_record.custom_id
-        first_params = cast(dict[str, Any], first_payload[0]["params"])
+        first_params = first_payload[0]["params"]
         assert first_params["messages"] == [
             {"role": "user", "content": [{"type": "text", "text": "look up sample"}]}
         ]
-        tool_param = cast(list[dict[str, Any]], first_params["tools"])[0]
+        tool_param = _dict_list(first_params["tools"])[0]
         assert tool_param["name"] == "lookup"
         assert "query" in tool_param["input_schema"]["properties"]
 
@@ -187,19 +190,18 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         second_batch = transport.flush()
         assert second_batch is not None
         assert second_batch == BatchInfo("msgbatch_fake_2", "in_progress")
-        second_payload = cast(
-            list[dict[str, Any]],
-            client.submissions[1][0]["params"]["messages"],
+        second_payload = _dict_list(
+            client.submissions[1][0]["params"]["messages"]
         )
         assert any(
             block.get("type") == "tool_use"
             for message in second_payload
-            for block in message["content"]
+            for block in _dict_list(message["content"])
         )
         assert any(
             block.get("type") == "tool_result"
             for message in second_payload
-            for block in message["content"]
+            for block in _dict_list(message["content"])
         )
 
         client.complete(
@@ -308,7 +310,7 @@ def test_anthropic_request_drops_strands_runtime_kwargs(tmp_path: Path) -> None:
         with pytest.raises(InterruptException):
             await anext(
                 model.stream(
-                    cast(Messages, [{"role": "user", "content": "hello"}]),
+                    strands_messages([{"role": "user", "content": "hello"}]),
                     model_state={"response_id": "must-not-leak"},
                     dynamic_trailing_blocks=2,
                     max_tokens=32,
@@ -342,11 +344,8 @@ def test_structured_output_is_an_async_generator_stub(tmp_path: Path) -> None:
         transport.close()
 
 
-def _tool_use_message() -> dict[str, object]:
+def _tool_use_message() -> NormalizedMessage:
     return {
-        "id": "msg_fake_tool_use",
-        "type": "message",
-        "role": "assistant",
         "content": [
             {
                 "type": "tool_use",
@@ -355,31 +354,35 @@ def _tool_use_message() -> dict[str, object]:
                 "input": {"query": "sample"},
             }
         ],
-        "model": "claude-test",
         "stop_reason": "tool_use",
-        "stop_sequence": None,
-        "usage": {"input_tokens": 12, "output_tokens": 7},
     }
 
 
-def _text_message(text: str) -> dict[str, object]:
+def _text_message(text: str) -> NormalizedMessage:
     return {
-        "id": "msg_fake_final",
-        "type": "message",
-        "role": "assistant",
         "content": [{"type": "text", "text": text}],
-        "model": "claude-test",
         "stop_reason": "end_turn",
-        "stop_sequence": None,
-        "usage": {"input_tokens": 20, "output_tokens": 9},
     }
 
 
-def _succeeded(custom_id: str, message: dict[str, object]) -> dict[str, object]:
+def _succeeded(custom_id: str, message: NormalizedMessage) -> BatchResultEnvelope:
     return {
         "custom_id": custom_id,
-        "result": {"type": "succeeded", "message": message},
+        "result": make_succeeded(message),
     }
+
+
+def _dict_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise AssertionError("expected a list")
+    result: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict) or any(
+            not isinstance(key, str) for key in item
+        ):
+            raise AssertionError("expected a list of string-keyed objects")
+        result.append({key: field for key, field in item.items()})
+    return result
 
 
 def _round_trip_snapshot(snapshot: Snapshot) -> Snapshot:

@@ -13,6 +13,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from io import BytesIO
 from typing import Literal, Protocol, cast
 
+from program_set.batch_result import (
+    BatchResultEnvelope,
+    NormalizedContentBlock,
+    NormalizedMessage,
+    StopReason,
+)
 from program_set.batch_transport import (
     BatchInfo,
     BatchProtocolError,
@@ -201,7 +207,7 @@ def _batch_failure_error(status: object, errors: object) -> object:
     }
 
 
-def _normalize_result(line: Mapping[str, object]) -> dict[str, object]:
+def _normalize_result(line: Mapping[str, object]) -> BatchResultEnvelope:
     custom_id = line.get("custom_id")
     if not isinstance(custom_id, str) or not custom_id:
         raise BatchProtocolError("OpenAI result line has no valid custom_id")
@@ -253,7 +259,7 @@ def _normalize_result(line: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _responses_message(body: Mapping[str, object], custom_id: str) -> dict[str, object]:
+def _responses_message(body: Mapping[str, object], custom_id: str) -> NormalizedMessage:
     status = body.get("status")
     if status not in {"completed", "incomplete"}:
         raise BatchProtocolError(
@@ -263,7 +269,7 @@ def _responses_message(body: Mapping[str, object], custom_id: str) -> dict[str, 
     output = body.get("output", [])
     if not isinstance(output, list):
         raise BatchProtocolError(f"Responses output for {custom_id!r} is not a list")
-    content: list[dict[str, object]] = []
+    content: list[NormalizedContentBlock] = []
     saw_text = False
     for raw_item in output:
         item = _as_mapping(raw_item)
@@ -352,6 +358,7 @@ def _responses_message(body: Mapping[str, object], custom_id: str) -> dict[str, 
 
     has_function_call = any(block["type"] == "tool_use" for block in content)
     incomplete = _as_mapping(body.get("incomplete_details"))
+    stop_reason: StopReason
     if has_function_call:
         stop_reason = "tool_use"
     elif incomplete is not None and incomplete.get("reason") == "max_output_tokens":
