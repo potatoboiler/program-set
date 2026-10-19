@@ -27,9 +27,7 @@ class FakeFiles:
         self.contents: dict[str, str] = {}
         self.content_calls: list[str] = []
 
-    def create(
-        self, *, file: OpenAIFileUpload, purpose: Literal["batch"]
-    ) -> object:
+    def create(self, *, file: OpenAIFileUpload, purpose: Literal["batch"]) -> object:
         filename, content_file, content_type = file
         file_id = f"input-{len(self.uploads) + 1}"
         content = content_file.read()
@@ -787,9 +785,9 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
 
         with pytest.raises(NotImplementedError, match="structured output"):
             _responses_params(
-                    strands_messages(
-                        [{"role": "user", "content": [{"image": "not-supported"}]}]
-                    ),
+                strands_messages(
+                    [{"role": "user", "content": [{"image": "not-supported"}]}]
+                ),
                 None,
                 None,
                 None,
@@ -799,9 +797,9 @@ def test_unsupported_multimodal_and_structured_output_inputs_are_rejected() -> N
             )
         with pytest.raises(NotImplementedError, match="unsupported user content"):
             _responses_params(
-                    strands_messages(
-                        [{"role": "user", "content": [{"image": "not-supported"}]}]
-                    ),
+                strands_messages(
+                    [{"role": "user", "content": [{"image": "not-supported"}]}]
+                ),
                 None,
                 None,
                 None,

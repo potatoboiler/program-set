@@ -55,10 +55,7 @@ class ExpiredBatchResult(TypedDict):
 
 
 type BatchResult = (
-    SucceededBatchResult
-    | ErroredBatchResult
-    | CanceledBatchResult
-    | ExpiredBatchResult
+    SucceededBatchResult | ErroredBatchResult | CanceledBatchResult | ExpiredBatchResult
 )
 
 
@@ -125,7 +122,9 @@ def _parse_content_block(value: object) -> NormalizedContentBlock:
         if not isinstance(tool_id, str) or not isinstance(name, str):
             raise BatchResultError("normalized tool_use block has invalid id/name")
         if not isinstance(raw_input, Mapping):
-            raise BatchResultError("normalized tool_use input is not a string-keyed object")
+            raise BatchResultError(
+                "normalized tool_use input is not a string-keyed object"
+            )
         input_value: dict[str, object] = {}
         for key, item in raw_input.items():
             if not isinstance(key, str):

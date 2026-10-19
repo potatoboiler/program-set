@@ -190,9 +190,7 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         second_batch = transport.flush()
         assert second_batch is not None
         assert second_batch == BatchInfo("msgbatch_fake_2", "in_progress")
-        second_payload = _dict_list(
-            client.submissions[1][0]["params"]["messages"]
-        )
+        second_payload = _dict_list(client.submissions[1][0]["params"]["messages"])
         assert any(
             block.get("type") == "tool_use"
             for message in second_payload

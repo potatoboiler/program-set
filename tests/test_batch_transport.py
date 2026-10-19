@@ -301,7 +301,9 @@ class BatchTransportTests(unittest.TestCase):
         with self.assertRaises(BatchProtocolError):
             self.transport.poll("msgbatch_test")
 
-    def test_normalized_result_parser_validates_and_discards_provider_extras(self) -> None:
+    def test_normalized_result_parser_validates_and_discards_provider_extras(
+        self,
+    ) -> None:
         result = parse_batch_result(
             {
                 "type": "succeeded",

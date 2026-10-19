@@ -138,7 +138,9 @@ class AnthropicBatchClient:
         for response in self._batch_resource().results(batch_id):
             custom_id = field(response, "custom_id")
             if not isinstance(custom_id, str) or not custom_id:
-                raise BatchProtocolError("Anthropic batch result has no valid custom_id")
+                raise BatchProtocolError(
+                    "Anthropic batch result has no valid custom_id"
+                )
             yield {
                 "custom_id": custom_id,
                 "result": _normalize_anthropic_result(field(response, "result")),
@@ -645,9 +647,7 @@ def _normalize_anthropic_result(value: object) -> BatchResult:
                 signature = field(block, "signature")
                 if not isinstance(signature, str):
                     raise BatchProtocolError("Anthropic reasoning block is malformed")
-                normalized_content.append(
-                    {"type": "reasoning", "signature": signature}
-                )
+                normalized_content.append({"type": "reasoning", "signature": signature})
             else:
                 raise BatchProtocolError(
                     f"unsupported Anthropic result content block {block_type!r}"
