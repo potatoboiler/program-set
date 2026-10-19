@@ -25,6 +25,9 @@ from batch_test_types import (
 from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.interrupt import Interrupt, InterruptException
+from strands.multiagent.graph import Graph, GraphEdge, GraphNode
+from strands.session import SnapshotSessionManager
+from strands.storage import LocalFileStorage
 
 from program_set.anthropic_batch import AnthropicBatchClient
 from program_set.anthropic_compaction import encode_compaction_signature
@@ -677,6 +680,91 @@ def test_structured_output_is_an_async_generator_stub(tmp_path: Path) -> None:
 
     try:
         asyncio.run(consume())
+    finally:
+        transport.close()
+
+
+def test_graph_parallel_batch_nodes_resume_with_caller_defined_dependencies(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "graph-batches.sqlite")
+    storage = LocalFileStorage(str(tmp_path / "graph-snapshots"))
+    session_id = "parallel-graph"
+    try:
+
+        def build_graph() -> tuple[
+            Graph,
+            tuple[BatchBackedModel, BatchBackedModel, BatchBackedModel],
+        ]:
+            left_model = BatchBackedModel(
+                transport, agent_id="graph-left", model_id="claude-test"
+            )
+            right_model = BatchBackedModel(
+                transport, agent_id="graph-right", model_id="claude-test"
+            )
+            joined_model = BatchBackedModel(
+                transport, agent_id="graph-joined", model_id="claude-test"
+            )
+            left = GraphNode("left", Agent(model=left_model))
+            right = GraphNode("right", Agent(model=right_model))
+            joined = GraphNode(
+                "joined", Agent(model=joined_model), dependencies={left, right}
+            )
+            return (
+                Graph(
+                    nodes={"left": left, "right": right, "joined": joined},
+                    edges={GraphEdge(left, joined), GraphEdge(right, joined)},
+                    entry_points={left, right},
+                    session_manager=SnapshotSessionManager(
+                        session_id, storage=storage, multi_agent_save_latest_on="node"
+                    ),
+                    id="parallel-graph",
+                ),
+                (left_model, right_model, joined_model),
+            )
+
+        graph, (left_model, right_model, joined_model) = build_graph()
+        first = graph("combine independent findings")
+        assert first.interrupts is not None and len(first.interrupts) == 2
+        assert set(left_model.queued_request_ids + right_model.queued_request_ids) == {
+            interrupt.reason["request_id"] for interrupt in first.interrupts
+        }
+        assert joined_model.queued_request_ids == []
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        assert len(client.submissions[0]) == 2  # one shared batch for parallel nodes
+        _complete_batch(
+            client,
+            transport,
+            left_model.queued_request_ids + right_model.queued_request_ids,
+            [_text_message("left finding"), _text_message("right finding")],
+        )
+
+        # A new Graph definition restores the runtime through the public session
+        # manager; the caller supplies only ready responses, not a scheduling plan.
+        restored_graph, (_, _, restored_joined_model) = build_graph()
+        second = restored_graph(
+            ready_batch_interrupt_responses(first.interrupts, transport)
+        )
+        assert second.interrupts is not None and len(second.interrupts) == 1
+        assert len(restored_joined_model.queued_request_ids) == 1
+        joined_request_id = restored_joined_model.queued_request_ids[0]
+        assert transport.get_request(joined_request_id).status == "queued"
+        assert transport.flush() == BatchInfo("msgbatch_fake_2", "in_progress")
+        joined_payload = str(client.submissions[1][0]["params"]["messages"])
+        assert "left finding" in joined_payload
+        assert "right finding" in joined_payload
+        _complete_batch(
+            client,
+            transport,
+            [joined_request_id],
+            [_text_message("combined finding")],
+        )
+        final = restored_graph(
+            ready_batch_interrupt_responses(second.interrupts, transport)
+        )
+        assert final.interrupts == []
+        assert final.completed_nodes == 3
     finally:
         transport.close()
 
