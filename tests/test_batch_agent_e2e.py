@@ -1153,6 +1153,152 @@ def test_nested_agent_tools_resume_parent_child_and_grandchild(
         transport.close()
 
 
+def test_preserved_child_owns_durable_history_across_parent_invocations(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "preserved-child.sqlite")
+    storage = LocalFileStorage(str(tmp_path / "child-snapshots"))
+    try:
+
+        def build_parent() -> tuple[Agent, BatchBackedModel, Agent, BatchBackedModel]:
+            child_model = BatchBackedModel(
+                transport, agent_id="persistent-child", model_id="claude-test"
+            )
+            child = Agent(
+                model=child_model,
+                name="persistent_child",
+                description="Remember prior facts",
+                session_manager=SnapshotSessionManager(
+                    "persistent-child-session", storage=storage
+                ),
+            )
+            parent_model = BatchBackedModel(
+                transport, agent_id="persistent-parent", model_id="claude-test"
+            )
+            parent = Agent(
+                model=parent_model,
+                tools=[child.as_tool(preserve_context=True)],
+            )
+            return parent, parent_model, child, child_model
+
+        parent, parent_model, child, child_model = build_parent()
+        first = parent("ask child one")
+        assert len(first.interrupts or []) == 1
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        parent_request_id = parent_model.queued_request_ids[-1]
+        _complete_batch(
+            client,
+            transport,
+            [parent_request_id],
+            [
+                _tool_use_message(
+                    "persistent_child", "toolu_persist_one", {"input": "ask child one"}
+                )
+            ],
+        )
+        first = parent(
+            ready_batch_interrupt_responses(first.interrupts or [], transport)
+        )
+        assert first.stop_reason == "interrupt"
+        child_request_id = child_model.queued_request_ids[-1]
+        assert any(
+            "ask child one" in str(message["content"])
+            for message in child.messages
+            if message["role"] == "user"
+        )
+        assert transport.flush() == BatchInfo("msgbatch_fake_2", "in_progress")
+        _complete_batch(
+            client,
+            transport,
+            [child_request_id],
+            [_text_message("remembered fact")],
+        )
+        first = parent(
+            ready_batch_interrupt_responses(first.interrupts or [], transport)
+        )
+        assert first.stop_reason == "interrupt"  # parent's post-tool model turn
+        assert child.messages[-1]["content"] == [{"text": "remembered fact"}]
+        assert transport.flush() == BatchInfo("msgbatch_fake_3", "in_progress")
+        parent_followup = parent_model.queued_request_ids[-1]
+        _complete_batch(
+            client,
+            transport,
+            [parent_followup],
+            [_text_message("first interaction done")],
+        )
+        parent(ready_batch_interrupt_responses(first.interrupts or [], transport))
+
+        # Reconstruct the child with the same definition/session ID. The public
+        # session manager restores its history independently of the parent.
+        parent, parent_model, child, child_model = build_parent()
+        assert child.messages[-2:]
+        assert any(
+            block.get("text") == "remembered fact"
+            for message in child.messages
+            for block in message["content"]
+            if isinstance(block, dict)
+        )
+        second = parent("ask child two")
+        assert len(second.interrupts or []) == 1
+        assert transport.flush() == BatchInfo("msgbatch_fake_4", "in_progress")
+        parent_request_id = parent_model.queued_request_ids[-1]
+        _complete_batch(
+            client,
+            transport,
+            [parent_request_id],
+            [
+                _tool_use_message(
+                    "persistent_child", "toolu_persist_two", {"input": "ask child two"}
+                )
+            ],
+        )
+        second = parent(
+            ready_batch_interrupt_responses(second.interrupts or [], transport)
+        )
+        assert second.stop_reason == "interrupt"
+        child_request_id = child_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_5", "in_progress")
+        second_payload = _dict_list(client.submissions[-1][0]["params"]["messages"])
+        assert any(
+            block.get("text") == "remembered fact"
+            for message in second_payload
+            for block in _dict_list(message["content"])
+        )
+        assert any(
+            block.get("text") == "ask child two"
+            for message in second_payload
+            for block in _dict_list(message["content"])
+        )
+        _complete_batch(
+            client,
+            transport,
+            [child_request_id],
+            [_text_message("second answer")],
+        )
+        second = parent(
+            ready_batch_interrupt_responses(second.interrupts or [], transport)
+        )
+        assert second.stop_reason == "interrupt"
+        parent_followup = parent_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_6", "in_progress")
+        _complete_batch(
+            client,
+            transport,
+            [parent_followup],
+            [_text_message("second interaction done")],
+        )
+        assert (
+            parent(
+                ready_batch_interrupt_responses(second.interrupts or [], transport)
+            ).stop_reason
+            == "end_turn"
+        )
+        assert sum(message["role"] == "user" for message in child.messages) == 2
+    finally:
+        transport.close()
+
+
 def test_ready_batch_interrupt_responses_validate_and_leave_other_interrupts_alone(
     tmp_path: Path,
 ) -> None:
