@@ -2,7 +2,8 @@
 
 Raising ``InterruptException`` directly from ``Model.stream`` is undocumented
 Strands behavior. It is verified only against Strands 1.61.1; callers own batch
-submission, polling, and re-entry.
+submission, polling, and re-entry. TODO: determine whether to formalize the
+deferred-inference contract through an upstream Strands contribution.
 """
 
 from __future__ import annotations
@@ -116,6 +117,7 @@ class DeferredBatchModel(Model):
                     id=request_id,
                     name="batch-response-pending",
                     reason={
+                        "source": "program-set.deferred-batch-model",
                         "request_id": request_id,
                         "custom_id": record.custom_id,
                         "status": record.status,

@@ -24,10 +24,11 @@ from batch_test_types import (
 )
 from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
-from strands.interrupt import InterruptException
+from strands.interrupt import Interrupt, InterruptException
 
 from program_set.anthropic_batch import AnthropicBatchClient
 from program_set.anthropic_compaction import encode_compaction_signature
+from program_set.batch_interrupts import ready_batch_interrupt_responses
 from program_set.batch_model import BatchBackedModel
 from program_set.batch_result import (
     BatchResultEnvelope,
@@ -38,6 +39,8 @@ from program_set.batch_transport import (
     BatchInfo,
     BatchRequestEnvelope,
     BatchTransport,
+    SubmissionUncertainError,
+    UnknownRequestError,
 )
 
 
@@ -678,6 +681,159 @@ def test_structured_output_is_an_async_generator_stub(tmp_path: Path) -> None:
         transport.close()
 
 
+def test_ready_batch_interrupt_responses_validate_and_leave_other_interrupts_alone(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "interrupt-helper.sqlite")
+    try:
+        model = BatchBackedModel(
+            transport, agent_id="interrupt-helper", model_id="claude-test"
+        )
+        result = Agent(model=model)("helper test")
+        assert result.interrupts is not None
+        batch_interrupt = result.interrupts[0]
+        assert batch_interrupt.reason["source"] == "program-set.deferred-batch-model"
+        foreign = Interrupt(
+            "approval-id", "approval-required", {"question": "Proceed?"}
+        )
+        assert (
+            ready_batch_interrupt_responses([batch_interrupt, foreign], transport) == []
+        )
+
+        request_id = model.queued_request_ids[0]
+        custom_id = transport.get_request(request_id).custom_id
+        same_named_foreign = [
+            Interrupt("foreign-malformed", "batch-response-pending", ["not a reason"]),
+            Interrupt(
+                "foreign-plausible",
+                "batch-response-pending",
+                {"request_id": request_id, "custom_id": custom_id},
+            ),
+        ]
+        assert ready_batch_interrupt_responses(same_named_foreign, transport) == []
+        with pytest.raises(UnknownRequestError):
+            ready_batch_interrupt_responses(
+                [
+                    Interrupt(
+                        "unknown-id",
+                        "batch-response-pending",
+                        {
+                            "source": "program-set.deferred-batch-model",
+                            "request_id": "not-registered",
+                            "custom_id": "not-registered-custom",
+                        },
+                    )
+                ],
+                transport,
+            )
+
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        _complete_batch(client, transport, [request_id], [_text_message("ready")])
+        assert ready_batch_interrupt_responses(
+            [batch_interrupt, foreign], transport
+        ) == [
+            {
+                "interruptResponse": {
+                    "interruptId": batch_interrupt.id,
+                    "response": {"request_id": request_id, "ready": True},
+                }
+            }
+        ]
+        namespaced_interrupt_id = f"v1:agent_as_tool:toolu_parent:{batch_interrupt.id}"
+        namespaced = Interrupt(
+            namespaced_interrupt_id,
+            "batch-response-pending",
+            batch_interrupt.reason,
+        )
+        namespaced_response = ready_batch_interrupt_responses([namespaced], transport)
+        assert namespaced_response[0]["interruptResponse"]["interruptId"] == (
+            namespaced_interrupt_id
+        )
+        assert ready_batch_interrupt_responses([foreign], transport) == []
+
+        wrong_custom_id = Interrupt(
+            batch_interrupt.id,
+            "batch-response-pending",
+            {
+                "request_id": request_id,
+                "source": "program-set.deferred-batch-model",
+                "custom_id": "not-the-durable-custom-id",
+            },
+        )
+        with pytest.raises(ValueError, match="does not match durable custom_id"):
+            ready_batch_interrupt_responses([wrong_custom_id], transport)
+    finally:
+        transport.close()
+
+
+def test_ready_batch_interrupt_responses_surface_terminal_failure(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    transport = BatchTransport(client, tmp_path / "failed-interrupt.sqlite")
+    try:
+        model = BatchBackedModel(
+            transport, agent_id="failed-interrupt", model_id="claude-test"
+        )
+        result = Agent(model=model)("failed request")
+        assert result.interrupts is not None
+        request_id = model.queued_request_ids[0]
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        record = transport.get_request(request_id)
+        assert record.batch_id is not None
+        client.complete(
+            record.batch_id,
+            [
+                {
+                    "custom_id": record.custom_id,
+                    "result": {
+                        "type": "errored",
+                        "error": {"code": "mock_failure", "message": "offline"},
+                    },
+                }
+            ],
+        )
+        transport.poll(record.batch_id)
+        with pytest.raises(RuntimeError, match=request_id):
+            ready_batch_interrupt_responses(result.interrupts, transport)
+    finally:
+        transport.close()
+
+
+def test_ready_batch_interrupt_responses_surface_uncertain_submission(
+    tmp_path: Path,
+) -> None:
+    class FailingCreateClient(FakeAnthropicBatchClient):
+        def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo:
+            super().create_batch(requests)
+            raise TimeoutError("simulated ambiguous create")
+
+    client = FailingCreateClient()
+    transport = BatchTransport(client, tmp_path / "uncertain-interrupt.sqlite")
+    try:
+        model = BatchBackedModel(
+            transport, agent_id="uncertain-interrupt", model_id="claude-test"
+        )
+        result = Agent(model=model)("uncertain request")
+        assert result.interrupts is not None
+        request_id = model.queued_request_ids[0]
+
+        with pytest.raises(SubmissionUncertainError) as flush_error:
+            transport.flush()
+        record = transport.get_request(request_id)
+        assert record.status == "submit_unknown"
+        assert record.submission_id == flush_error.value.submission_id
+        assert flush_error.value.request_ids == (request_id,)
+
+        with pytest.raises(SubmissionUncertainError) as helper_error:
+            ready_batch_interrupt_responses(result.interrupts, transport)
+        assert helper_error.value.submission_id == record.submission_id
+        assert helper_error.value.request_ids == (request_id,)
+    finally:
+        transport.close()
+
+
 def _tool_use_message() -> NormalizedMessage:
     return {
         "content": [
@@ -697,6 +853,28 @@ def _text_message(text: str) -> NormalizedMessage:
         "content": [{"type": "text", "text": text}],
         "stop_reason": "end_turn",
     }
+
+
+def _complete_batch(
+    client: FakeAnthropicBatchClient,
+    transport: BatchTransport,
+    request_ids: list[str],
+    messages: list[NormalizedMessage],
+) -> None:
+    assert len(request_ids) == len(messages)
+    records = [transport.get_request(request_id) for request_id in request_ids]
+    batch_ids = {record.batch_id for record in records}
+    assert len(batch_ids) == 1 and None not in batch_ids
+    batch_id = next(iter(batch_ids))
+    assert batch_id is not None
+    client.complete(
+        batch_id,
+        [
+            _succeeded(record.custom_id, message)
+            for record, message in zip(records, messages, strict=True)
+        ],
+    )
+    assert transport.poll(batch_id).processing_status == "ended"
 
 
 def _succeeded(custom_id: str, message: NormalizedMessage) -> BatchResultEnvelope:
