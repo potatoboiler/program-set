@@ -19,12 +19,11 @@ from program_set.batch_result import (
     NormalizedMessage,
     StopReason,
 )
+from program_set.batch_json import field, jsonable
 from program_set.batch_transport import (
     BatchInfo,
     BatchProtocolError,
     BatchRequestEnvelope,
-    _field,
-    _jsonable,
 )
 from program_set.openai_responses_request import (
     OpenAIResponsesBatchLine,
@@ -93,7 +92,7 @@ class OpenAIBatchClient:
             file=("batch.jsonl", input_file, "application/jsonl"),
             purpose="batch",
         )
-        input_file_id = _field(uploaded_file, "id")
+        input_file_id = field(uploaded_file, "id")
         if not isinstance(input_file_id, str) or not input_file_id:
             raise BatchProtocolError("OpenAI file upload response is missing id")
 
@@ -131,8 +130,8 @@ class OpenAIBatchClient:
                     f"retrieved batch {info.batch_id!r} for requested {batch_id!r}"
                 )
 
-        output_file_id = _field(batch, "output_file_id")
-        error_file_id = _field(batch, "error_file_id")
+        output_file_id = field(batch, "output_file_id")
+        error_file_id = field(batch, "error_file_id")
         results: list[dict[str, object]] = []
         seen: set[str] = set()
         for file_id in (output_file_id, error_file_id):
@@ -147,8 +146,8 @@ class OpenAIBatchClient:
                     seen.add(custom_id)
                     results.append(result)
 
-        batch_status = _field(batch, "status")
-        batch_errors = _field(batch, "errors")
+        batch_status = field(batch, "status")
+        batch_errors = field(batch, "errors")
         if batch_errors is not None or batch_status in _BATCH_FAILURE_STATUSES:
             error = _batch_failure_error(batch_status, batch_errors)
             results.extend(
@@ -184,8 +183,8 @@ def _validated_lines(
 
 
 def _batch_info(batch: object) -> BatchInfo:
-    batch_id = _field(batch, "id")
-    status = _field(batch, "status")
+    batch_id = field(batch, "id")
+    status = field(batch, "status")
     if not isinstance(batch_id, str) or not batch_id:
         raise BatchProtocolError("OpenAI batch response is missing id")
     if not isinstance(status, str) or not status:
@@ -197,7 +196,7 @@ def _batch_info(batch: object) -> BatchInfo:
 
 def _batch_failure_error(status: object, errors: object) -> object:
     if errors is not None:
-        normalized = _jsonable(errors)
+        normalized = jsonable(errors)
         if normalized:
             return normalized
     return {
@@ -218,7 +217,7 @@ def _normalize_result(line: Mapping[str, object]) -> BatchResultEnvelope:
             "custom_id": custom_id,
             "result": {
                 "type": "errored",
-                "error": _jsonable(error or {"message": "request has no response"}),
+                "error": jsonable(error or {"message": "request has no response"}),
             },
         }
 
@@ -231,11 +230,11 @@ def _normalize_result(line: Mapping[str, object]) -> BatchResultEnvelope:
         if error_value is None:
             error_value = {
                 "status_code": status_code,
-                "body": _jsonable(response.get("body")),
+                "body": jsonable(response.get("body")),
             }
         return {
             "custom_id": custom_id,
-            "result": {"type": "errored", "error": _jsonable(error_value)},
+            "result": {"type": "errored", "error": jsonable(error_value)},
         }
     if body is None:
         raise BatchProtocolError(
@@ -247,7 +246,7 @@ def _normalize_result(line: Mapping[str, object]) -> BatchResultEnvelope:
             "custom_id": custom_id,
             "result": {
                 "type": "errored",
-                "error": _jsonable(body.get("error") or {"status": "failed"}),
+                "error": jsonable(body.get("error") or {"status": "failed"}),
             },
         }
 
@@ -390,23 +389,23 @@ def _read_jsonl(file_response: object, file_id: str) -> list[dict[str, object]]:
 def _file_text(response: object, file_id: str) -> str:
     if isinstance(response, bytes):
         return response.decode("utf-8")
-    text = _field(response, "text")
+    text = field(response, "text")
     if isinstance(text, str):
         return text
-    content = _field(response, "content")
+    content = field(response, "content")
     if isinstance(content, bytes):
         return content.decode("utf-8")
     raise BatchProtocolError(f"OpenAI file content for {file_id!r} is not text")
 
 
 def _as_mapping(value: object) -> Mapping[str, object] | None:
-    dumped = _jsonable(value)
+    dumped = jsonable(value)
     return cast(Mapping[str, object], dumped) if isinstance(dumped, Mapping) else None
 
 
 def _json_line(value: object) -> str:
     return json.dumps(
-        _jsonable(value),
+        jsonable(value),
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),

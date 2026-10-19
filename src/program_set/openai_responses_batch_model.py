@@ -13,8 +13,9 @@ from typing import Any, cast
 from strands.types.content import Messages, SystemContentBlock
 from strands.types.tools import ToolChoice, ToolChoiceToolDict, ToolSpec
 
+from program_set.batch_json import canonical_json
 from program_set.batch_transport import BatchTransport
-from program_set.deferred_batch_model import DeferredBatchModel, canonical_json
+from program_set.deferred_batch_model import DeferredBatchModel
 from program_set.openai_responses_request import (
     OpenAIResponsesRequest,
     decode_reasoning_item,

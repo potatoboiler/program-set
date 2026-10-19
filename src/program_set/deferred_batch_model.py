@@ -8,7 +8,6 @@ submission, polling, and re-entry.
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 from collections.abc import AsyncGenerator, Mapping
 from typing import Any, cast
@@ -22,6 +21,7 @@ from strands.types.streaming import StreamEvent
 from strands.types.tools import ToolChoice, ToolSpec
 
 from program_set.batch_result import NormalizedMessage
+from program_set.batch_json import canonical_json
 from program_set.batch_transport import BatchTransport, UnknownRequestError
 
 
@@ -174,7 +174,3 @@ def message_events(message: NormalizedMessage) -> list[StreamEvent]:
         )
     events.append({"messageStop": {"stopReason": message["stop_reason"]}})
     return events
-
-
-def canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

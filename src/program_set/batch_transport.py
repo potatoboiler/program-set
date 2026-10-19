@@ -24,6 +24,7 @@ from program_set.batch_result import (
     StopReason,
     parse_batch_result,
 )
+from program_set.batch_json import canonical_json, field, jsonable
 
 RequestStatus = Literal[
     "queued",
@@ -139,12 +140,12 @@ class AnthropicBatchClient:
     ) -> Iterable[object]:
         del expected_custom_ids
         for response in self._batch_resource().results(batch_id):
-            custom_id = _field(response, "custom_id")
+            custom_id = field(response, "custom_id")
             if not isinstance(custom_id, str) or not custom_id:
                 raise BatchProtocolError("Anthropic batch result has no valid custom_id")
             yield {
                 "custom_id": custom_id,
-                "result": _normalize_anthropic_result(_field(response, "result")),
+                "result": _normalize_anthropic_result(field(response, "result")),
             }
 
     def _batch_resource(self) -> _AnthropicBatchesResource:
@@ -381,8 +382,8 @@ class BatchTransport:
         for response in self._client.iter_batch_results(
             batch_id, expected_custom_ids=tuple(registered)
         ):
-            custom_id = _field(response, "custom_id")
-            result = _field(response, "result")
+            custom_id = field(response, "custom_id")
+            result = field(response, "result")
             if not isinstance(custom_id, str) or not custom_id:
                 raise BatchProtocolError("batch result has no valid custom_id")
             if custom_id in results_by_custom_id:
@@ -390,7 +391,7 @@ class BatchTransport:
                     f"duplicate result for custom_id {custom_id!r}"
                 )
             try:
-                normalized_result = parse_batch_result(_jsonable(result))
+                normalized_result = parse_batch_result(jsonable(result))
             except BatchResultError as exc:
                 raise BatchProtocolError(
                     f"invalid result for {custom_id!r}: {exc}"
@@ -582,19 +583,19 @@ def _validate_id(value: str, name: str) -> None:
 
 
 def _batch_info(value: object) -> BatchInfo:
-    batch_id = _field(value, "id")
-    processing_status = _field(value, "processing_status")
+    batch_id = field(value, "id")
+    processing_status = field(value, "processing_status")
     if not isinstance(batch_id, str) or not isinstance(processing_status, str):
         raise BatchProtocolError("Anthropic batch response is missing id/status")
     return BatchInfo(batch_id, processing_status)
 
 
 def _normalize_anthropic_result(value: object) -> BatchResult:
-    result_type = _field(value, "type")
+    result_type = field(value, "type")
     if result_type == "succeeded":
-        message = _field(value, "message")
-        content = _field(message, "content")
-        stop_reason = _field(message, "stop_reason")
+        message = field(value, "message")
+        content = field(message, "content")
+        stop_reason = field(message, "stop_reason")
         if not isinstance(content, list):
             raise BatchProtocolError("Anthropic result message content is not a list")
         if stop_reason == "stop_sequence":
@@ -613,16 +614,16 @@ def _normalize_anthropic_result(value: object) -> BatchResult:
 
         normalized_content: list[dict[str, object]] = []
         for block in content:
-            block_type = _field(block, "type")
+            block_type = field(block, "type")
             if block_type == "text":
-                text = _field(block, "text")
+                text = field(block, "text")
                 if not isinstance(text, str):
                     raise BatchProtocolError("Anthropic text block is not text")
                 normalized_content.append({"type": "text", "text": text})
             elif block_type == "tool_use":
-                tool_id = _field(block, "id")
-                name = _field(block, "name")
-                tool_input = _field(block, "input")
+                tool_id = field(block, "id")
+                name = field(block, "name")
+                tool_input = field(block, "input")
                 if (
                     not isinstance(tool_id, str)
                     or not isinstance(name, str)
@@ -645,7 +646,7 @@ def _normalize_anthropic_result(value: object) -> BatchResult:
                     }
                 )
             elif block_type == "reasoning":
-                signature = _field(block, "signature")
+                signature = field(block, "signature")
                 if not isinstance(signature, str):
                     raise BatchProtocolError("Anthropic reasoning block is malformed")
                 normalized_content.append(
@@ -663,7 +664,7 @@ def _normalize_anthropic_result(value: object) -> BatchResult:
             },
         }
     if result_type == "errored":
-        return {"type": "errored", "error": _jsonable(_field(value, "error"))}
+        return {"type": "errored", "error": jsonable(field(value, "error"))}
     if result_type == "canceled":
         return {"type": "canceled"}
     if result_type == "expired":
@@ -676,31 +677,8 @@ def _validate_batch_info(batch: BatchInfo) -> None:
         raise BatchProtocolError("batch response is missing id/status")
 
 
-def _field(value: object, name: str) -> object:
-    if isinstance(value, Mapping):
-        mapping = cast(Mapping[str, object], value)
-        return mapping.get(name)
-    return getattr(value, name, None)
-
-
-def _jsonable(value: object) -> object:
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        return model_dump(mode="json")
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
-        return to_dict()
-    return value
-
-
 def _dump_json(value: object) -> str:
-    return json.dumps(
-        _jsonable(value),
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    return canonical_json(value)
 
 
 def _now() -> str:
