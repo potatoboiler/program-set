@@ -11,17 +11,15 @@ import anthropic
 import httpx2
 from batch_test_types import succeeded, successful_result
 
+from program_set.anthropic_batch import AnthropicBatchClient, _AnthropicSDKClient
 from program_set.batch_result import BatchResultError, parse_batch_result
 from program_set.batch_transport import (
-    AnthropicBatchClient,
     BatchInfo,
     BatchProtocolError,
     BatchRequestEnvelope,
     BatchTransport,
     RequestConflictError,
     SubmissionUncertainError,
-    _AnthropicSDKClient,
-    _normalize_anthropic_result,
 )
 from program_set.deferred_batch_model import message_events
 
@@ -32,6 +30,11 @@ def request(text: str = "hello") -> dict[str, object]:
         "max_tokens": 80,
         "messages": [{"role": "user", "content": text}],
     }
+
+
+def normalize_anthropic_result(value: object) -> object:
+    adapter = AnthropicBatchClient(cast(_AnthropicSDKClient, object()))
+    return adapter._normalize_result(value)
 
 
 class FakeBatchClient:
@@ -852,7 +855,7 @@ class BatchTransportTests(unittest.TestCase):
             },
         }
 
-        normalized = _normalize_anthropic_result(raw_result)
+        normalized = normalize_anthropic_result(raw_result)
         parsed = parse_batch_result(normalized)
 
         expected_blocks = [
@@ -896,7 +899,7 @@ class BatchTransportTests(unittest.TestCase):
             "tool_changes": [],
         }
         self.assertEqual(
-            _normalize_anthropic_result(
+            normalize_anthropic_result(
                 {
                     "type": "succeeded",
                     "message": {
@@ -924,7 +927,7 @@ class BatchTransportTests(unittest.TestCase):
             {"type": "compaction", "tool_changes": "not-a-list"},
         ):
             with self.subTest(block_type=block), self.assertRaises(BatchProtocolError):
-                _normalize_anthropic_result(
+                normalize_anthropic_result(
                     {
                         "type": "succeeded",
                         "message": {"content": [block], "stop_reason": "end_turn"},
@@ -933,7 +936,7 @@ class BatchTransportTests(unittest.TestCase):
 
     def test_anthropic_on_demand_compaction_stop_reason_is_unsupported(self) -> None:
         self.assertEqual(
-            _normalize_anthropic_result(
+            normalize_anthropic_result(
                 {
                     "type": "succeeded",
                     "message": {"content": [], "stop_reason": "compaction"},
