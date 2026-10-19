@@ -26,6 +26,7 @@ from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.interrupt import Interrupt, InterruptException
 from strands.multiagent.graph import Graph, GraphEdge, GraphNode
+from strands.multiagent.swarm import Swarm
 from strands.session import SnapshotSessionManager
 from strands.storage import LocalFileStorage
 
@@ -765,6 +766,117 @@ def test_graph_parallel_batch_nodes_resume_with_caller_defined_dependencies(
         )
         assert final.interrupts == []
         assert final.completed_nodes == 3
+    finally:
+        transport.close()
+
+
+def test_swarm_handoff_executes_next_agent_then_resumes_its_batch_request(
+    tmp_path: Path,
+) -> None:
+    client = FakeAnthropicBatchClient()
+    database = tmp_path / "swarm-batches.sqlite"
+    transport = BatchTransport(client, database)
+    storage = LocalFileStorage(str(tmp_path / "swarm-snapshots"))
+    try:
+
+        def build_swarm() -> tuple[Swarm, BatchBackedModel, BatchBackedModel]:
+            researcher_model = BatchBackedModel(
+                transport, agent_id="swarm-researcher", model_id="claude-test"
+            )
+            writer_model = BatchBackedModel(
+                transport, agent_id="swarm-writer", model_id="claude-test"
+            )
+            researcher = Agent(
+                model=researcher_model, name="researcher", description="Research facts"
+            )
+            writer = Agent(
+                model=writer_model, name="writer", description="Write result"
+            )
+            return (
+                Swarm(
+                    [researcher, writer],
+                    entry_point=researcher,
+                    session_manager=SnapshotSessionManager(
+                        "handoff-swarm", storage=storage
+                    ),
+                    id="handoff-swarm",
+                ),
+                researcher_model,
+                writer_model,
+            )
+
+        swarm, researcher_model, writer_model = build_swarm()
+        first = swarm("write a short answer")
+        assert len(first.interrupts) == 1
+        researcher_request_id = researcher_model.queued_request_ids[0]
+        assert transport.flush() == BatchInfo("msgbatch_fake_1", "in_progress")
+        handoff_tools = _dict_list(client.submissions[0][0]["params"]["tools"])
+        assert any(
+            tool_spec["name"] == "handoff_to_agent" for tool_spec in handoff_tools
+        )
+        _complete_batch(
+            client,
+            transport,
+            [researcher_request_id],
+            [
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_handoff_writer",
+                            "name": "handoff_to_agent",
+                            "input": {
+                                "agent_name": "writer",
+                                "message": "Draft the answer from the findings.",
+                                "context": {"finding": "stable sample"},
+                            },
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            ],
+        )
+
+        after_handoff_tool = swarm(
+            ready_batch_interrupt_responses(first.interrupts, transport)
+        )
+        assert len(after_handoff_tool.interrupts) == 1
+        assert writer_model.queued_request_ids == []
+        researcher_followup = researcher_model.queued_request_ids[-1]
+        assert transport.flush() == BatchInfo("msgbatch_fake_2", "in_progress")
+        _complete_batch(
+            client,
+            transport,
+            [researcher_followup],
+            [_text_message("Research complete.")],
+        )
+        handed_off = swarm(
+            ready_batch_interrupt_responses(after_handoff_tool.interrupts, transport)
+        )
+        assert len(handed_off.interrupts) == 1
+        assert len(writer_model.queued_request_ids) == 1
+        writer_request_id = writer_model.queued_request_ids[0]
+        assert transport.flush() == BatchInfo("msgbatch_fake_3", "in_progress")
+        writer_payload = str(client.submissions[2][0]["params"]["messages"])
+        assert "Draft the answer from the findings." in writer_payload
+        assert "stable sample" in writer_payload
+        _complete_batch(
+            client, transport, [writer_request_id], [_text_message("The answer.")]
+        )
+        # Rebuild the same Swarm definition; it must restore its paused handoff
+        # through SnapshotSessionManager and not invoke the old Swarm again.
+        transport.close()
+        transport = BatchTransport(client, database)
+        restored_swarm, _, _ = build_swarm()
+        completed = restored_swarm(
+            ready_batch_interrupt_responses(handed_off.interrupts, transport)
+        )
+        assert completed.interrupts == []
+        assert completed.status.value == "completed"
+        assert [node.node_id for node in completed.node_history] == [
+            "researcher",
+            "writer",
+        ]
     finally:
         transport.close()
 
