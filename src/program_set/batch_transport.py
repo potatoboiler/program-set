@@ -69,16 +69,11 @@ class RequestRecord:
 
 
 class BatchClient(Protocol):
-    """Transport adapter with an opaque, reusable provider preflight result."""
+    """Provider adapter with a side-effect-free local validation preflight."""
 
-    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> object: ...
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None: ...
 
-    def create_batch(
-        self,
-        requests: Sequence[BatchRequestEnvelope],
-        *,
-        validated: object,
-    ) -> BatchInfo: ...
+    def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo: ...
 
     def retrieve_batch(self, batch_id: str) -> BatchInfo: ...
 
@@ -121,10 +116,8 @@ class AnthropicBatchClient:
         for request in requests:
             _validate_anthropic_request(request)
 
-    def create_batch(
-        self, requests: Sequence[BatchRequestEnvelope], *, validated: object
-    ) -> BatchInfo:
-        del validated
+    def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo:
+        self.validate_requests(requests)
         with_options = getattr(self._client, "with_options", None)
         if callable(with_options):
             # A POST retry after a timeout could create duplicate remote work.
@@ -312,7 +305,7 @@ class BatchTransport:
             ]
             # Provider validation must fail before the durable state suggests
             # that the create request may have reached the provider.
-            validated = self._client.validate_requests(requests)
+            self._client.validate_requests(requests)
             with self._connection:
                 self._connection.executemany(
                     "UPDATE requests SET status = 'submitting', submission_id = ? "
@@ -321,7 +314,7 @@ class BatchTransport:
                 )
 
             try:
-                batch = self._client.create_batch(requests, validated=validated)
+                batch = self._client.create_batch(requests)
                 _validate_batch_info(batch)
                 with self._connection:
                     self._connection.execute(

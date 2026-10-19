@@ -42,10 +42,7 @@ class FakeAnthropicBatchClient:
     def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
         return None
 
-    def create_batch(
-        self, requests: Sequence[BatchRequestEnvelope], *, validated: object
-    ) -> BatchInfo:
-        del validated
+    def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo:
         batch_id = f"msgbatch_fake_{len(self.submissions) + 1}"
         self.submissions.append(list(requests))
         self._batches[batch_id] = ("in_progress", [])

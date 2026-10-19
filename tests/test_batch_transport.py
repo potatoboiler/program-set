@@ -39,10 +39,7 @@ class FakeBatchClient:
     def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
         return None
 
-    def create_batch(
-        self, requests: Sequence[BatchRequestEnvelope], *, validated: object
-    ) -> BatchInfo:
-        del validated
+    def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo:
         self.submissions.append(list(requests))
         if self.fail_create:
             raise TimeoutError("simulated lost response")
@@ -283,9 +280,9 @@ class BatchTransportTests(unittest.TestCase):
             requests: list[BatchRequestEnvelope] = [
                 {"custom_id": "sdk-test", "params": request()}
             ]
-            validated = adapter.validate_requests(requests)
+            adapter.validate_requests(requests)
             with self.assertRaises(anthropic.APIStatusError):
-                adapter.create_batch(requests, validated=validated)
+                adapter.create_batch(requests)
             self.assertEqual(attempts, 1)
         finally:
             sdk_client.close()
@@ -390,9 +387,9 @@ class BatchTransportTests(unittest.TestCase):
         sdk_client = SDKClient()
         adapter = AnthropicBatchClient(sdk_client)
         payload: BatchRequestEnvelope = {"custom_id": "id", "params": request()}
-        validated = adapter.validate_requests([payload])
+        adapter.validate_requests([payload])
         self.assertEqual(
-            adapter.create_batch([payload], validated=validated).batch_id,
+            adapter.create_batch([payload]).batch_id,
             "remote-id",
         )
         self.assertEqual(sdk_client.messages.batches.sent, [payload])

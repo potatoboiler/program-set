@@ -74,32 +74,12 @@ class OpenAIBatchClient:
         self._client = cast(_OpenAIClient, client)
         self._retrieved: dict[str, object] = {}
 
-    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> object:
-        if not requests:
-            raise ValueError("an OpenAI batch must contain at least one request")
-        lines: list[OpenAIResponsesBatchLine] = []
-        for request in requests:
-            custom_id = request["custom_id"]
-            body = OpenAIResponsesRequest.model_validate(request["params"])
-            lines.append(
-                OpenAIResponsesBatchLine(
-                    custom_id=custom_id,
-                    method="POST",
-                    url=_ENDPOINT,
-                    body=body,
-                )
-            )
-        return lines
+    def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
+        _validated_lines(requests)
 
-    def create_batch(
-        self,
-        requests: Sequence[BatchRequestEnvelope],
-        *,
-        validated: object,
-    ) -> BatchInfo:
-        if not requests:
-            raise ValueError("an OpenAI batch must contain at least one request")
-        lines = cast(Sequence[OpenAIResponsesBatchLine], validated)
+    def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo:
+        lines = _validated_lines(requests)
+
         client = self._without_retries()
         jsonl_lines = [
             _json_line(line.model_dump(mode="json", exclude_none=True))
@@ -160,7 +140,6 @@ class OpenAIBatchClient:
                 for line in _read_jsonl(self._client.files.content(file_id), file_id):
                     result = _normalize_result(line)
                     custom_id = result["custom_id"]
-                    assert isinstance(custom_id, str)
                     if custom_id in seen:
                         raise BatchProtocolError(
                             f"duplicate OpenAI result for custom_id {custom_id!r}"
@@ -182,6 +161,26 @@ class OpenAIBatchClient:
             )
 
         return results
+
+
+def _validated_lines(
+    requests: Sequence[BatchRequestEnvelope],
+) -> list[OpenAIResponsesBatchLine]:
+    if not requests:
+        raise ValueError("an OpenAI batch must contain at least one request")
+    lines: list[OpenAIResponsesBatchLine] = []
+    for request in requests:
+        custom_id = request["custom_id"]
+        body = OpenAIResponsesRequest.model_validate(request["params"])
+        lines.append(
+            OpenAIResponsesBatchLine(
+                custom_id=custom_id,
+                method="POST",
+                url=_ENDPOINT,
+                body=body,
+            )
+        )
+    return lines
 
 
 def _batch_info(batch: object) -> BatchInfo:
