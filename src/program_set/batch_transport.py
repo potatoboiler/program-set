@@ -23,6 +23,7 @@ from program_set.batch_result import (
     BatchResultType,
     parse_batch_result,
 )
+from program_set.provider_profile import ProviderProfile
 
 RequestStatus = Literal[
     "queued",
@@ -97,6 +98,10 @@ class UnknownBatchError(BatchTransportError):
     """The batch ID is not registered in this transport."""
 
 
+class ProviderProfileNotFoundError(BatchTransportError):
+    """The requested provider profile is not stored in this transport."""
+
+
 class BatchProtocolError(BatchTransportError):
     """The client returned a response inconsistent with the registered batch."""
 
@@ -126,7 +131,7 @@ class BatchTransport:
     batch IDs, and returned batch results. There is no timer or worker loop.
     """
 
-    def __init__(self, client: BatchClient, database: str | Path) -> None:
+    def __init__(self, client: BatchClient | None, database: str | Path) -> None:
         self._client = client
         self._lock = threading.RLock()
         database_path = str(Path(database).expanduser())
@@ -136,6 +141,63 @@ class BatchTransport:
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._initialize()
+
+    def set_client(self, client: BatchClient) -> None:
+        """Bind a provider adapter, e.g. after loading its durable profile."""
+
+        with self._lock:
+            self._client = client
+
+    def save_provider_profile(self, profile: ProviderProfile) -> None:
+        """Insert or replace non-secret provider configuration by profile ID."""
+
+        config_json = _dump_json(dict(profile.config))
+        with self._lock, self._connection:
+            self._connection.execute(
+                "INSERT INTO provider_profiles (profile_id, provider, config_json) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(profile_id) DO UPDATE SET "
+                "provider = excluded.provider, config_json = excluded.config_json",
+                (profile.profile_id, profile.provider, config_json),
+            )
+
+    def get_provider_profile(self, profile_id: str) -> ProviderProfile:
+        """Load and validate a provider profile from SQLite."""
+
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT profile_id, provider, config_json FROM provider_profiles "
+                "WHERE profile_id = ?",
+                (profile_id,),
+            ).fetchone()
+        if row is None:
+            raise ProviderProfileNotFoundError(
+                f"provider profile {profile_id!r} is not stored"
+            )
+        try:
+            config = json.loads(row["config_json"])
+            if not isinstance(config, Mapping):
+                raise ValueError("provider profile config is not an object")
+            return ProviderProfile(
+                profile_id=str(row["profile_id"]),
+                provider=row["provider"],
+                config=config,
+            )
+        except (TypeError, ValueError) as exc:
+            raise BatchProtocolError(
+                f"stored provider profile {profile_id!r} is malformed: {exc}"
+            ) from exc
+
+    def list_provider_profiles(self) -> tuple[ProviderProfile, ...]:
+        """List validated profiles in stable profile-ID order."""
+
+        with self._lock:
+            profile_ids = self._connection.execute(
+                "SELECT profile_id FROM provider_profiles ORDER BY profile_id"
+            ).fetchall()
+        return tuple(
+            self.get_provider_profile(str(row["profile_id"])) for row in profile_ids
+        )
 
     def enqueue(
         self,
@@ -224,6 +286,8 @@ class BatchTransport:
             if not rows:
                 return None
 
+            client = self._require_client()
+
             submission_id = str(uuid.uuid4())
             request_ids = [str(row["request_id"]) for row in rows]
             requests: list[BatchRequestEnvelope] = [
@@ -235,7 +299,7 @@ class BatchTransport:
             ]
             # Provider validation must fail before the durable state suggests
             # that the create request may have reached the provider.
-            self._client.validate_requests(requests)
+            client.validate_requests(requests)
             with self._connection:
                 self._connection.executemany(
                     "UPDATE requests SET status = 'submitting', submission_id = ? "
@@ -244,7 +308,7 @@ class BatchTransport:
                 )
 
             try:
-                batch = self._client.create_batch(requests)
+                batch = client.create_batch(requests)
                 _validate_batch_info(batch)
                 with self._connection:
                     self._connection.execute(
@@ -281,7 +345,8 @@ class BatchTransport:
             if known is None:
                 raise UnknownBatchError(f"batch_id {batch_id!r} is not registered")
 
-            batch = self._client.retrieve_batch(batch_id)
+            client = self._require_client()
+            batch = client.retrieve_batch(batch_id)
             _validate_batch_info(batch)
             if batch.batch_id != batch_id:
                 raise BatchProtocolError(
@@ -296,10 +361,10 @@ class BatchTransport:
                 )
 
             if batch.processing_status == "ended":
-                self._persist_results(batch_id)
+                self._persist_results(batch_id, client)
             return batch
 
-    def _persist_results(self, batch_id: str) -> None:
+    def _persist_results(self, batch_id: str, client: BatchClient) -> None:
         registered = {
             str(row["custom_id"]): str(row["request_id"])
             for row in self._connection.execute(
@@ -308,7 +373,7 @@ class BatchTransport:
             ).fetchall()
         }
         results_by_custom_id: dict[str, tuple[BatchResultType, str]] = {}
-        for response in self._client.iter_batch_results(
+        for response in client.iter_batch_results(
             batch_id, expected_custom_ids=tuple(registered)
         ):
             custom_id = field(response, "custom_id")
@@ -438,6 +503,11 @@ class BatchTransport:
                     processing_status TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS provider_profiles (
+                    profile_id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    config_json TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS requests (
                     request_id TEXT PRIMARY KEY,
                     custom_id TEXT NOT NULL UNIQUE,
@@ -462,6 +532,14 @@ class BatchTransport:
                 "UPDATE requests SET status = 'submit_unknown' "
                 "WHERE status = 'submitting'"
             )
+
+    def _require_client(self) -> BatchClient:
+        client = self._client
+        if client is None:
+            raise BatchTransportError(
+                "no batch client is configured; call set_client() before submission or polling"
+            )
+        return client
 
 
 def _validated_params(params: object) -> dict[str, object]:
