@@ -4,11 +4,12 @@ import tempfile
 import unittest
 from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import anthropic
 import httpx2
-
 from batch_test_types import succeeded, successful_result
+
 from program_set.batch_result import BatchResultError, parse_batch_result
 from program_set.batch_transport import (
     AnthropicBatchClient,
@@ -18,6 +19,7 @@ from program_set.batch_transport import (
     BatchTransport,
     RequestConflictError,
     SubmissionUncertainError,
+    _AnthropicSDKClient,
 )
 
 
@@ -243,6 +245,10 @@ class BatchTransportTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.messages = Messages()
 
+            def with_options(self, *, max_retries: int) -> SDKClient:
+                assert max_retries == 0
+                return self
+
         cases = (
             ("bad-payload", {**request(), "stream": True}, "valid-id"),
             ("bad-id", request(), "contains.dot"),
@@ -276,7 +282,7 @@ class BatchTransportTests(unittest.TestCase):
         http_client = httpx2.Client(transport=httpx2.MockTransport(fail_request))
         sdk_client = anthropic.Anthropic(api_key="test-only", http_client=http_client)
         try:
-            adapter = AnthropicBatchClient(sdk_client)
+            adapter = AnthropicBatchClient(cast(_AnthropicSDKClient, sdk_client))
             requests: list[BatchRequestEnvelope] = [
                 {"custom_id": "sdk-test", "params": request()}
             ]
@@ -303,7 +309,7 @@ class BatchTransportTests(unittest.TestCase):
                     "id": "provider-message-id",
                     "usage": {"input_tokens": 3},
                     "content": [{"type": "text", "text": "ok"}],
-                    "stop_reason": "end_turn",
+                    "stop_reason": "stop_sequence",
                 },
             }
         )
@@ -353,8 +359,8 @@ class BatchTransportTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.sent: list[BatchRequestEnvelope] = []
 
-            def create(self, *, requests: list[BatchRequestEnvelope]) -> object:
-                self.sent = requests
+            def create(self, *, requests: Sequence[BatchRequestEnvelope]) -> object:
+                self.sent = list(requests)
                 return {"id": "remote-id", "processing_status": "in_progress"}
 
             def retrieve(self, batch_id: str) -> object:
@@ -383,6 +389,10 @@ class BatchTransportTests(unittest.TestCase):
         class SDKClient:
             def __init__(self) -> None:
                 self.messages = Messages()
+
+            def with_options(self, *, max_retries: int) -> SDKClient:
+                assert max_retries == 0
+                return self
 
         sdk_client = SDKClient()
         adapter = AnthropicBatchClient(sdk_client)

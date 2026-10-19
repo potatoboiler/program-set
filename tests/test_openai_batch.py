@@ -7,17 +7,17 @@ import json
 from collections.abc import Sequence
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
+from batch_test_types import strands_messages, successful_result
 from pydantic import ValidationError
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
 
-from batch_test_types import strands_messages, successful_result
 from program_set.batch_result import SucceededBatchResult
 from program_set.batch_transport import BatchInfo, BatchProtocolError, BatchTransport
-from program_set.openai_batch_transport import OpenAIBatchClient
+from program_set.openai_batch_transport import OpenAIBatchClient, OpenAIFileUpload
 from program_set.openai_responses_batch_model import OpenAIBatchBackedModel
 
 
@@ -27,8 +27,10 @@ class FakeFiles:
         self.contents: dict[str, str] = {}
         self.content_calls: list[str] = []
 
-    def create(self, *, file: object, purpose: str) -> object:
-        filename, content_file, content_type = file  # type: ignore[misc]
+    def create(
+        self, *, file: OpenAIFileUpload, purpose: Literal["batch"]
+    ) -> object:
+        filename, content_file, content_type = file
         file_id = f"input-{len(self.uploads) + 1}"
         content = content_file.read()
         self.uploads.append(
@@ -116,8 +118,8 @@ class FakeOpenAIClient:
         self.batches = FakeBatches(self.files)
         self.options: list[dict[str, object]] = []
 
-    def with_options(self, **options: Any) -> FakeOpenAIClient:
-        self.options.append(options)
+    def with_options(self, *, max_retries: int) -> FakeOpenAIClient:
+        self.options.append({"max_retries": max_retries})
         return self
 
 

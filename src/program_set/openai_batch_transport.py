@@ -11,15 +11,15 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from io import BytesIO
-from typing import Literal, Protocol, cast
+from typing import IO, Literal, Protocol, cast
 
+from program_set.batch_json import field, jsonable
 from program_set.batch_result import (
     BatchResultEnvelope,
     NormalizedContentBlock,
     NormalizedMessage,
     StopReason,
 )
-from program_set.batch_json import field, jsonable
 from program_set.batch_transport import (
     BatchInfo,
     BatchProtocolError,
@@ -34,10 +34,13 @@ from program_set.openai_responses_request import (
 _ENDPOINT: Literal["/v1/responses"] = "/v1/responses"
 _TERMINAL_STATUSES = {"completed", "failed", "expired", "cancelled", "canceled"}
 _BATCH_FAILURE_STATUSES = {"failed", "expired", "cancelled", "canceled"}
+type OpenAIFileUpload = tuple[str, IO[bytes], str]
 
 
 class _OpenAIFilesResource(Protocol):
-    def create(self, *, file: object, purpose: Literal["batch"]) -> object: ...
+    def create(
+        self, *, file: OpenAIFileUpload, purpose: Literal["batch"]
+    ) -> object: ...
 
     def content(self, file_id: str) -> object: ...
 
@@ -55,8 +58,13 @@ class _OpenAIBatchesResource(Protocol):
 
 
 class _OpenAIClient(Protocol):
-    files: _OpenAIFilesResource
-    batches: _OpenAIBatchesResource
+    @property
+    def files(self) -> _OpenAIFilesResource: ...
+
+    @property
+    def batches(self) -> _OpenAIBatchesResource: ...
+
+    def with_options(self, *, max_retries: int) -> _OpenAIClient: ...
 
 
 class OpenAIBatchClient:
@@ -69,8 +77,8 @@ class OpenAIBatchClient:
     transport persists per-request outcomes at that point.
     """
 
-    def __init__(self, client: object) -> None:
-        self._client = cast(_OpenAIClient, client)
+    def __init__(self, client: _OpenAIClient) -> None:
+        self._client = client
         self._retrieved: dict[str, object] = {}
 
     def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
@@ -106,10 +114,7 @@ class OpenAIBatchClient:
         return info
 
     def _without_retries(self) -> _OpenAIClient:
-        with_options = getattr(self._client, "with_options", None)
-        if callable(with_options):
-            return cast(_OpenAIClient, with_options(max_retries=0))
-        return self._client
+        return self._client.with_options(max_retries=0)
 
     def retrieve_batch(self, batch_id: str) -> BatchInfo:
         batch = self._client.batches.retrieve(batch_id)
@@ -132,7 +137,7 @@ class OpenAIBatchClient:
 
         output_file_id = field(batch, "output_file_id")
         error_file_id = field(batch, "error_file_id")
-        results: list[dict[str, object]] = []
+        results: list[BatchResultEnvelope] = []
         seen: set[str] = set()
         for file_id in (output_file_id, error_file_id):
             if isinstance(file_id, str) and file_id:

@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Literal, TypedDict, TypeAlias
+from typing import Literal, TypedDict
 
-StopReason: TypeAlias = Literal["end_turn", "tool_use", "max_tokens"]
-BatchResultType: TypeAlias = Literal["succeeded", "errored", "canceled", "expired"]
+type StopReason = Literal["end_turn", "tool_use", "max_tokens"]
+type BatchResultType = Literal["succeeded", "errored", "canceled", "expired"]
 
 
 class TextContentBlock(TypedDict):
@@ -26,7 +26,7 @@ class ReasoningContentBlock(TypedDict):
     signature: str
 
 
-NormalizedContentBlock: TypeAlias = (
+type NormalizedContentBlock = (
     TextContentBlock | ToolUseContentBlock | ReasoningContentBlock
 )
 
@@ -54,7 +54,7 @@ class ExpiredBatchResult(TypedDict):
     type: Literal["expired"]
 
 
-BatchResult: TypeAlias = (
+type BatchResult = (
     SucceededBatchResult
     | ErroredBatchResult
     | CanceledBatchResult
@@ -93,7 +93,8 @@ def parse_batch_result(value: object) -> BatchResult:
 def _parse_message(value: object) -> NormalizedMessage:
     mapping = _mapping(value, "succeeded batch result message")
     stop_reason = mapping.get("stop_reason")
-    if stop_reason == "end_turn":
+    if stop_reason == "end_turn" or stop_reason == "stop_sequence":
+        # Older SQLite rows stored Anthropic's raw stop reason.
         normalized_stop_reason: StopReason = "end_turn"
     elif stop_reason == "tool_use":
         normalized_stop_reason = "tool_use"

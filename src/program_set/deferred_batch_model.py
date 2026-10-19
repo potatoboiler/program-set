@@ -10,18 +10,18 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections.abc import AsyncGenerator, Mapping
-from typing import Any, cast
+from typing import Any
 
 from pydantic import BaseModel
 from strands.agent.agent_metadata import AgentMetadata
 from strands.interrupt import Interrupt, InterruptException
 from strands.models import Model
-from strands.types.content import Messages, SystemContentBlock
-from strands.types.streaming import StreamEvent
+from strands.types.content import ContentBlockStart, Messages, SystemContentBlock
+from strands.types.streaming import ContentBlockDelta, StreamEvent
 from strands.types.tools import ToolChoice, ToolSpec
 
-from program_set.batch_result import NormalizedMessage
 from program_set.batch_json import canonical_json
+from program_set.batch_result import NormalizedMessage
 from program_set.batch_transport import BatchTransport, UnknownRequestError
 
 
@@ -150,8 +150,8 @@ def message_events(message: NormalizedMessage) -> list[StreamEvent]:
     events: list[StreamEvent] = [{"messageStart": {"role": "assistant"}}]
     for block in message["content"]:
         if block["type"] == "text":
-            delta = {"text": block["text"]}
-            start: dict[str, object] = {}
+            delta: ContentBlockDelta = {"text": block["text"]}
+            start: ContentBlockStart = {}
         elif block["type"] == "reasoning":
             delta = {"reasoningContent": {"signature": block["signature"]}}
             start = {}
@@ -162,15 +162,8 @@ def message_events(message: NormalizedMessage) -> list[StreamEvent]:
             raise AssertionError(
                 f"unsupported normalized batch response block: {block!r}"
             )
-        events.extend(
-            cast(
-                list[StreamEvent],
-                [
-                    {"contentBlockStart": {"start": start}},
-                    {"contentBlockDelta": {"delta": delta}},
-                    {"contentBlockStop": {}},
-                ],
-            )
-        )
+        events.append({"contentBlockStart": {"start": start}})
+        events.append({"contentBlockDelta": {"delta": delta}})
+        events.append({"contentBlockStop": {}})
     events.append({"messageStop": {"stopReason": message["stop_reason"]}})
     return events

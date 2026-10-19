@@ -15,16 +15,17 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Protocol, Self, TypedDict, cast
+from typing import Any, Literal, Protocol, Self, TypedDict, cast
 
+from program_set.batch_json import canonical_json, field, jsonable
 from program_set.batch_result import (
     BatchResult,
     BatchResultError,
     BatchResultType,
+    NormalizedContentBlock,
     StopReason,
     parse_batch_result,
 )
-from program_set.batch_json import canonical_json, field, jsonable
 
 RequestStatus = Literal[
     "queued",
@@ -84,19 +85,23 @@ class BatchClient(Protocol):
 
 
 class _AnthropicBatchesResource(Protocol):
-    def create(self, *, requests: Sequence[BatchRequestEnvelope]) -> object: ...
+    def create(self, *, requests: Sequence[Any]) -> object: ...
 
     def retrieve(self, batch_id: str) -> object: ...
 
-    def results(self, batch_id: str) -> Iterable[object]: ...
+    def results(self, batch_id: str) -> Iterable[Any]: ...
 
 
 class _AnthropicMessagesResource(Protocol):
-    batches: _AnthropicBatchesResource
+    @property
+    def batches(self) -> _AnthropicBatchesResource: ...
 
 
 class _AnthropicSDKClient(Protocol):
-    messages: _AnthropicMessagesResource
+    @property
+    def messages(self) -> _AnthropicMessagesResource: ...
+
+    def with_options(self, *, max_retries: int) -> _AnthropicSDKClient: ...
 
 
 class AnthropicBatchClient:
@@ -105,13 +110,12 @@ class AnthropicBatchClient:
     The SDK client is injected by the application, so constructing this adapter
     never creates a client, reads credentials, or makes a request.
 
-    Clients exposing the public ``with_options`` method use per-call retries
-    disabled for batch creation. Lightweight test doubles without that method
-    are called directly and should not add their own retry behavior.
+    Per-call retries are disabled for batch creation so a POST retry after a
+    timeout cannot create duplicate remote work.
     """
 
-    def __init__(self, client: object) -> None:
-        self._client = cast(_AnthropicSDKClient, client)
+    def __init__(self, client: _AnthropicSDKClient) -> None:
+        self._client = client
 
     def validate_requests(self, requests: Sequence[BatchRequestEnvelope]) -> None:
         for request in requests:
@@ -119,15 +123,7 @@ class AnthropicBatchClient:
 
     def create_batch(self, requests: Sequence[BatchRequestEnvelope]) -> BatchInfo:
         self.validate_requests(requests)
-        with_options = getattr(self._client, "with_options", None)
-        if callable(with_options):
-            # A POST retry after a timeout could create duplicate remote work.
-            resource = cast(
-                _AnthropicSDKClient, with_options(max_retries=0)
-            ).messages.batches
-        else:
-            # Keep compatibility with injected deterministic SDK-shaped fakes.
-            resource = self._batch_resource()
+        resource = self._client.with_options(max_retries=0).messages.batches
         response = resource.create(requests=list(requests))
         return _batch_info(response)
 
@@ -378,7 +374,7 @@ class BatchTransport:
                 (batch_id,),
             ).fetchall()
         }
-        results_by_custom_id: dict[str, tuple[str, str]] = {}
+        results_by_custom_id: dict[str, tuple[BatchResultType, str]] = {}
         for response in self._client.iter_batch_results(
             batch_id, expected_custom_ids=tuple(registered)
         ):
@@ -612,7 +608,7 @@ def _normalize_anthropic_result(value: object) -> BatchResult:
                 f"unsupported Anthropic stop reason {stop_reason!r}"
             )
 
-        normalized_content: list[dict[str, object]] = []
+        normalized_content: list[NormalizedContentBlock] = []
         for block in content:
             block_type = field(block, "type")
             if block_type == "text":

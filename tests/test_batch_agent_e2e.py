@@ -15,16 +15,18 @@ from importlib.metadata import version
 from pathlib import Path
 
 import pytest
+from batch_test_types import (
+    strands_messages,
+)
+from batch_test_types import (
+    succeeded as make_succeeded,
+)
 from pydantic import BaseModel
 from strands import Agent, Snapshot, tool
 from strands.interrupt import InterruptException
 
-from batch_test_types import (
-    strands_messages,
-    succeeded as make_succeeded,
-)
-from program_set.batch_result import BatchResultEnvelope, NormalizedMessage
 from program_set.batch_model import BatchBackedModel
+from program_set.batch_result import BatchResultEnvelope, NormalizedMessage
 from program_set.batch_transport import (
     BatchInfo,
     BatchRequestEnvelope,
@@ -119,7 +121,8 @@ def test_batch_result_resumes_fresh_agent_and_completes_tool_cycle(
         ]
         tool_param = _dict_list(first_params["tools"])[0]
         assert tool_param["name"] == "lookup"
-        assert "query" in tool_param["input_schema"]["properties"]
+        schema = _dict_value(tool_param["input_schema"])
+        assert "query" in _dict_value(schema["properties"])
 
         client.complete(
             first_batch.batch_id,
@@ -371,15 +374,14 @@ def _succeeded(custom_id: str, message: NormalizedMessage) -> BatchResultEnvelop
 
 def _dict_list(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
-        raise AssertionError("expected a list")
-    result: list[dict[str, object]] = []
-    for item in value:
-        if not isinstance(item, dict) or any(
-            not isinstance(key, str) for key in item
-        ):
-            raise AssertionError("expected a list of string-keyed objects")
-        result.append({key: field for key, field in item.items()})
-    return result
+        raise TypeError("expected a list")
+    return [_dict_value(item) for item in value]
+
+
+def _dict_value(value: object) -> dict[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise TypeError("expected a string-keyed object")
+    return {key: field for key, field in value.items()}
 
 
 def _round_trip_snapshot(snapshot: Snapshot) -> Snapshot:

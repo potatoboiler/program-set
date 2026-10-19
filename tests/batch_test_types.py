@@ -6,7 +6,11 @@ from typing import cast
 
 from strands.types.content import Messages
 
-from program_set.batch_result import BatchResult, NormalizedMessage, SucceededBatchResult
+from program_set.batch_result import (
+    BatchResult,
+    NormalizedMessage,
+    SucceededBatchResult,
+)
 
 
 def strands_messages(value: object) -> Messages:
